@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import time as time_lib
 import json
 from captum.attr import IntegratedGradients
@@ -1011,6 +1012,19 @@ if pb1.button("▶️ INITIATE STREAM"): st.session_state.is_playing = True
 if pb2.button("⏸️ HALT STREAM"): st.session_state.is_playing = False
 playback_speed = st.sidebar.slider("Ping Rate (Frames Per Sec)", 1, 30, 10)
 
+if st.sidebar.button("⏭️ Jump to Next Alert/Critical Event", use_container_width=True):
+    if df is not None and 'activity_level' in df.columns:
+        future_hits = df[(df.index > st.session_state.current_index) & (df['activity_level'] >= 2)]
+        if not future_hits.empty:
+            st.session_state.current_index = int(future_hits.index[0])
+            st.session_state.stop_index = None
+            st.session_state.y_true_hist, st.session_state.y_pred_hist = [], []
+            st.sidebar.success(f"⏭️ Jumped to tick {future_hits.index[0]:,} — next Alert/Critical event.")
+        else:
+            st.sidebar.info("No further Alert/Critical events ahead in this dataset.")
+    else:
+        st.sidebar.warning("No ground-truth `activity_level` column available to bookmark against.")
+
 live_xai = st.sidebar.toggle("🧠 Live AI Explainability (XAI)", value=False,
                               help="Turn this on when parked in the AI Validation tab to see which telemetry features drove the AI's decision.")
 
@@ -1033,10 +1047,46 @@ X_tensor = torch.tensor(window[features].values, dtype=torch.float32).unsqueeze(
 
 with torch.no_grad():
     predicted_class = int(torch.argmax(model(X_tensor), dim=1).item())
+    live_probs = F.softmax(model(X_tensor), dim=1).squeeze(0).numpy()
 
 if 'activity_level' in latest_tick:
     st.session_state.y_true_hist.append(int(latest_tick['activity_level']))
     st.session_state.y_pred_hist.append(predicted_class)
+
+# ---- Short-horizon forecast: linear-trend extrapolation of the engineered
+# features a few ticks forward, then classified by the same model. This is
+# a lightweight projection (not a verified multi-step forecaster) -- it's
+# labelled as such everywhere it's shown, so nobody mistakes it for ground
+# truth. ----
+FORECAST_HORIZON_TICKS = 5
+
+
+def project_forward(window_df, feature_cols, horizon):
+    proj = window_df[feature_cols].copy().reset_index(drop=True)
+    for _ in range(horizon):
+        new_row = {}
+        for feat in feature_cols:
+            y = proj[feat].values
+            tail_n = min(10, len(y))
+            if tail_n >= 3:
+                xs = np.arange(tail_n)
+                slope = np.polyfit(xs, y[-tail_n:], 1)[0]
+            else:
+                slope = 0.0
+            new_row[feat] = y[-1] + slope if len(y) else 0.0
+        proj = pd.concat([proj, pd.DataFrame([new_row])], ignore_index=True)
+    return proj.tail(len(window_df)).reset_index(drop=True)
+
+
+forecast_class = predicted_class
+if len(window) >= 10:
+    try:
+        proj_window = project_forward(window, features, FORECAST_HORIZON_TICKS)
+        X_proj = torch.tensor(proj_window[features].values, dtype=torch.float32).unsqueeze(0)
+        with torch.no_grad():
+            forecast_class = int(torch.argmax(model(X_proj), dim=1).item())
+    except Exception:
+        forecast_class = predicted_class
 
 actions = {
     0: ("QUIET", "0.0 mm", "#34d399", "MAINTAIN_CURRENT_GEOMETRY"),
@@ -1045,6 +1095,7 @@ actions = {
     3: ("CRITICAL", "-12.0 mm", "#fb4d4d", "MAXIMUM_STRUCTURAL_SAFE_MODE_SHIELDING"),
 }
 status, cg_shift, color_hex, act_cmd = actions[predicted_class]
+forecast_status, _, forecast_color, _ = actions[forecast_class]
 
 mech_command = {"time": str(latest_tick['time']), "class": predicted_class, "shift_mm": cg_shift, "command": act_cmd}
 with open("actuator_command.json", "w") as f:
@@ -1067,23 +1118,26 @@ if predicted_class >= 2:
     components.html("""<script>try{const ctx=new (window.AudioContext||window.webkitAudioContext)();const o=ctx.createOscillator();const g=ctx.createGain();o.type='sine';o.frequency.setValueAtTime(880,ctx.currentTime);o.frequency.exponentialRampToValueAtTime(220,ctx.currentTime+.6);g.gain.setValueAtTime(.15,ctx.currentTime);g.gain.exponentialRampToValueAtTime(.0001,ctx.currentTime+.6);o.connect(g);g.connect(ctx.destination);o.start();o.stop(ctx.currentTime+.6);}catch(e){}</script>""", height=0)
     st.markdown(f"<div class='emergency-active'><h2 style='color:#fb4d4d !important;'>🚨 MECHANICAL ACTUATION TRIGGERED</h2><p>AI Threat Class {predicted_class} | Initiating <b>{cg_shift}</b> CG mass displacement.</p></div>", unsafe_allow_html=True)
 
-cm1, cm2, cm3, cm4 = st.columns(4)
+cm1, cm2, cm3, cm4, cm5 = st.columns(5)
 with cm1:
     reveal_card(f"<small>ORBITAL TIME</small><h3>{str(latest_tick['time'])[11:19]}</h3>")
 with cm2:
     energy = trapz_func(window['soft_flux'].fillna(0).values) if len(window) > 1 else 0
     reveal_card(f"<small>FLUENCE KINEMATICS</small><h3 style='color:#fbbf24;'>{energy:.2e}</h3>")
 with cm3:
-    reveal_card(f"<small>AI FORECAST</small><h3 style='color:{color_hex};'>CLASS {predicted_class}</h3>")
+    reveal_card(f"<small>AI CURRENT CLASS</small><h3 style='color:{color_hex};'>CLASS {predicted_class}</h3>")
 with cm4:
     reveal_card(f"<small>CG SHIFT (ACTUATOR)</small><h3 style='color:#5eead4;'>{cg_shift}</h3>")
+with cm5:
+    reveal_card(f"<small>PROJECTED +{FORECAST_HORIZON_TICKS} TICKS</small><h3 style='color:{forecast_color};'>{forecast_status}</h3>")
 
 with st.expander("ℹ️ What do these telemetry numbers indicate?"):
-    st.markdown("""
+    st.markdown(f"""
 - **Orbital Time:** Timestamp of the telemetry packet currently on-screen.
 - **Fluence Kinematics:** A trapezoidal-integration proxy of total energy deposited over the visible 60-tick window — how GOES-style energetics are estimated from a flux curve.
-- **AI Forecast:** The Attention-GRU's live 4-class read (0=Quiet → 3=Critical) of the last 60 telemetry ticks.
+- **AI Current Class:** The Attention-GRU's live 4-class read (0=Quiet → 3=Critical) of the last 60 telemetry ticks — this *is* verified ground-truth-comparable inference.
 - **CG Shift (Actuator):** The physical centre-of-gravity mass displacement the actuator model maps to that class, to reduce thermal/structural stress during high-radiation events.
+- **Projected +{FORECAST_HORIZON_TICKS} Ticks:** A lightweight *projection*, not a verified forecast — it linearly extrapolates the recent trend of each engineered feature {FORECAST_HORIZON_TICKS} ticks forward, then classifies that synthetic future window with the same model. Treat it as an early-warning nudge, not a guarantee.
 """)
 
 # ==========================================
@@ -1150,55 +1204,82 @@ if section == "📖 Mission Briefing":
     """, unsafe_allow_html=True)
 
 elif section == "📊 ISRO Telemetry":
-    theme.section_hero("telemetry", "ISRO Telemetry — Dual-Channel Physics", "Six live charts, one per row, each reading the same synced 60-tick window the AI just classified.")
+    theme.section_hero("telemetry", "ISRO Telemetry — Dual-Channel Physics", "One synced combined timeline (never desyncs, because it's literally one figure sharing one x-axis) plus the two non-time-domain physics views below.")
 
-    info_caption("<b>1 · SoLEXS Soft X-Ray</b> — the thermal expansion phase of a flare. Dotted lines are live Background / Elevated / Severe bands computed from this mission's own data distribution.")
-    fig_sol = go.Figure(go.Scatter(x=window["time"], y=window["soft_flux"], line=dict(color="#fb923c", width=2), fill='tozeroy', fillcolor='rgba(251,146,60,0.15)'))
-    fig_sol = add_severity_bands(fig_sol, df['soft_flux'].tail(2000).values)
-    st.plotly_chart(style_fig_dark(fig_sol, "1. SoLEXS Soft X-Ray (ISRO Standard)", "Soft Flux (W/m²)"), use_container_width=True)
+    # ---- combined, synced, WebGL-rendered timeline: channels + AI history share one x-axis ----
+    recent_n = min(len(window), len(st.session_state.y_pred_hist))
+    recent_preds = st.session_state.y_pred_hist[-recent_n:] if recent_n > 0 else []
+    recent_time = window['time'].iloc[-recent_n:] if recent_n > 0 else window['time']
 
-    info_caption("<b>2 · HEL1OS Hard X-Ray</b> — high-energy electron bursts. Jagged and sudden; an immediate radiation hazard to onboard electronics, and often the earliest warning signal.")
-    fig_hel = go.Figure(go.Scatter(x=window["time"], y=window["hard_flux"], line=dict(color="#5eead4", width=2), fill='tozeroy', fillcolor='rgba(94,234,212,0.15)'))
-    st.plotly_chart(style_fig_dark(fig_hel, "2. HEL1OS Hard X-Ray Sparks", "Hard Flux (counts)"), use_container_width=True)
+    info_caption(
+        "<b>Combined Telemetry &amp; AI Threat Timeline</b> — SoLEXS (soft X-ray, amber) and HEL1OS "
+        "(hard X-ray, teal) plotted against the AI's own class call underneath, all reading the exact "
+        "same 60-tick window on one shared clock. Dotted lines are live Background / Elevated / Severe "
+        "bands from this mission's own data distribution. The vertical marker is <i>now</i> — the same "
+        "tick driving the KPI cards above."
+    )
+    combo = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, row_heights=[0.62, 0.38], vertical_spacing=0.05,
+        subplot_titles=("SoLEXS + HEL1OS — Dual-Channel Flux", "AI Threat Class (live, same window)"),
+    )
+    combo.add_trace(go.Scattergl(x=window["time"], y=window["soft_flux"], name="SoLEXS (soft)",
+                                  line=dict(color="#fb923c", width=2), fill='tozeroy', fillcolor='rgba(251,146,60,0.12)'), row=1, col=1)
+    combo.add_trace(go.Scattergl(x=window["time"], y=window["hard_flux"], name="HEL1OS (hard)",
+                                  line=dict(color="#5eead4", width=2)), row=1, col=1)
+    p50, p90, p99 = np.nanpercentile(df['soft_flux'].tail(2000).values, [50, 90, 99]) if len(df) > 5 else (0, 0, 0)
+    for val, lbl, clr in zip([p50, p90, p99], ["Background", "Elevated", "Severe"], ["#34d399", "#fbbf24", "#fb4d4d"]):
+        combo.add_hline(y=val, line_dash="dot", line_color=clr, opacity=0.5, row=1, col=1,
+                         annotation_text=lbl, annotation_font_size=9, annotation_font_color=clr)
 
-    info_caption("<b>3 · Neupert Overlap</b> — Hard X-ray (teal) plotted against Soft X-ray (amber) on the same clock. The Neupert effect predicts the teal spikes should lead the amber swell — the lag between them is diagnostic of the flare's energetics.")
-    fig_curve = go.Figure()
-    fig_curve.add_trace(go.Scatter(x=window["time"], y=window["soft_flux"], name="SoLEXS", line=dict(color="#fb923c", width=2)))
-    fig_curve.add_trace(go.Scatter(x=window["time"], y=window["hard_flux"], name="HEL1OS", line=dict(color="#5eead4", width=2)))
-    st.plotly_chart(style_fig_dark(fig_curve, "3. Dual-Channel Neupert Overlap", "Flux"), use_container_width=True)
+    combo.add_trace(go.Scattergl(x=recent_time, y=recent_preds, mode='lines', line=dict(color="#a78bfa", width=2, shape='hv'),
+                                  name="AI Class", showlegend=False), row=2, col=1)
+    for yv, lbl in [(1, "Monitor"), (2, "Alert"), (3, "Critical")]:
+        combo.add_hline(y=yv, line_dash="dot", line_color="rgba(255,255,255,0.18)", row=2, col=1,
+                         annotation_text=lbl, annotation_font_size=9, annotation_font_color="#94a3b8")
 
-    info_caption("<b>4 · AI Threat History</b> — the model's own class call over time, so you can see how confident/alarmed the Attention-GRU has been recently, not just right now.")
-    if len(st.session_state.y_pred_hist) > 0:
-        hist_time = df['time'].iloc[max(0, idx - len(st.session_state.y_pred_hist)): idx]
-        fig_cast = go.Figure(go.Scatter(x=hist_time, y=st.session_state.y_pred_hist, mode='lines', line=dict(color="#a78bfa", width=2, shape='hv')))
-        st.plotly_chart(style_fig_dark(fig_cast, "4. AI Threat Predictions (Live History)", "Class (0-3)"), use_container_width=True)
-    else:
-        st.info("Gathering stream history — start playback to populate this chart.")
+    if len(window) > 0:
+        combo.add_vline(x=window["time"].iloc[-1], line_color="#eef2f7", line_width=1, opacity=0.55, row="all", col="all")
 
-    info_caption("<b>5 · QPP Spectral FFT</b> — Fast Fourier Transform of the soft-flux window. A clear spectral peak here means the flare is releasing energy in a periodic 'heartbeat' (Quasi-Periodic Pulsation), typically tied to repeated magnetic reconnection, not one smooth burst.")
-    yf = rfft(window['soft_flux'].fillna(0).values - np.mean(window['soft_flux'].fillna(0).values)) if len(window) > 0 else [0]
-    xf = rfftfreq(len(window), 1.0) if len(window) > 0 else [0]
-    fig_qpp = go.Figure(go.Scatter(x=xf, y=np.abs(yf) ** 2, mode='lines', line=dict(color="#fb4d4d", width=2)))
-    st.plotly_chart(style_fig_dark(fig_qpp, "5. QPP Spectral FFT (Magnetic Heartbeat)", "Power"), use_container_width=True)
+    combo.update_layout(
+        template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(color="#CBD5E1", family="Inter"), margin=dict(l=10, r=10, t=42, b=10),
+        hovermode="x unified", height=560, showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.06, x=0, bgcolor="rgba(0,0,0,0)"),
+    )
+    combo.update_yaxes(gridcolor='rgba(255,255,255,0.05)', title_text="Flux", row=1, col=1)
+    combo.update_yaxes(gridcolor='rgba(255,255,255,0.05)', title_text="Class (0-3)", range=[-0.3, 3.3], row=2, col=1)
+    combo.update_xaxes(gridcolor='rgba(255,255,255,0.05)')
+    combo.update_annotations(font=dict(family='Orbitron', size=13, color="#E8ECF5"))
+    st.plotly_chart(combo, use_container_width=True, config={'displayModeBar': False})
 
-    info_caption("<b>6 · Phase-Space Loop</b> — Heating Speed vs. Hard Flux, coloured by Soft Flux. Real flares trace a closed loop here instead of scattering randomly — a quick visual sanity-check that this is physics, not sensor noise.")
-    fig_phase = px.scatter(window, x="hard_flux", y="heating_slope", color="soft_flux", color_continuous_scale=["#34d399", "#fb923c", "#fb4d4d"])
-    st.plotly_chart(style_fig_dark(fig_phase, "6. Flare Loop (Phase-Space Map)", "Heating Speed (dΦ/dt)"), use_container_width=True)
+    fft_col, phase_col = st.columns(2)
+    with fft_col:
+        info_caption("<b>QPP Spectral FFT</b> — a clear peak means the flare is releasing energy in a periodic 'heartbeat' (Quasi-Periodic Pulsation), not one smooth burst.")
+        yf = rfft(window['soft_flux'].fillna(0).values - np.mean(window['soft_flux'].fillna(0).values)) if len(window) > 0 else [0]
+        xf = rfftfreq(len(window), 1.0) if len(window) > 0 else [0]
+        fig_qpp = go.Figure(go.Scattergl(x=xf, y=np.abs(yf) ** 2, mode='lines', line=dict(color="#fb4d4d", width=2), fill='tozeroy', fillcolor='rgba(251,77,77,0.1)'))
+        st.plotly_chart(style_fig_dark(fig_qpp, "QPP Spectral FFT (Magnetic Heartbeat)", "Power"), use_container_width=True, config={'displayModeBar': False})
+    with phase_col:
+        info_caption("<b>Phase-Space Loop</b> — Heating Speed vs. Hard Flux, coloured by Soft Flux. A closed loop here (not a random scatter) is a quick sanity-check that this is physics, not sensor noise.")
+        fig_phase = px.scatter(window, x="hard_flux", y="heating_slope", color="soft_flux",
+                                color_continuous_scale=["#34d399", "#fb923c", "#fb4d4d"], render_mode='webgl')
+        st.plotly_chart(style_fig_dark(fig_phase, "Flare Loop (Phase-Space Map)", "Heating Speed (dΦ/dt)"), use_container_width=True, config={'displayModeBar': False})
 
-    st.markdown("### 7 · Core Systems Gauges")
-    g1, g2, g3 = st.columns(3)
+    st.markdown("### Core Systems Gauges")
+    gauges = make_subplots(rows=1, cols=3, specs=[[{'type': 'domain'}, {'type': 'domain'}, {'type': 'domain'}]],
+                            subplot_titles=("Threat Class", "Displacement (mm)", "Structural Integrity Est. (%)"))
 
-    def create_gauge(val, title, rng):
-        color = "#34d399" if val < rng[1] * 0.3 else "#fbbf24" if val < rng[1] * 0.7 else "#fb4d4d"
-        fig = go.Figure(go.Indicator(mode="gauge+number", value=val, title={'text': title, 'font': {'color': '#FFF', 'family': 'Orbitron'}}, gauge={'axis': {'range': rng}, 'bar': {'color': color}}))
-        fig.update_layout(template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', height=200, margin=dict(l=10, r=10, t=30, b=10))
-        return fig
+    def gauge_color(val, rng):
+        return "#34d399" if val < rng[1] * 0.3 else "#fbbf24" if val < rng[1] * 0.7 else "#fb4d4d"
 
-    with g1: st.plotly_chart(create_gauge(predicted_class, "Threat Class", [0, 3]), use_container_width=True)
-    with g2: st.plotly_chart(create_gauge(abs(float(cg_shift.replace('mm', ''))), "Displacement (mm)", [0, 15]), use_container_width=True)
-    with g3:
-        qual_pct = min(100, 100 * (1 - (predicted_class / 3) * 0.6))
-        st.plotly_chart(create_gauge(qual_pct, "Structural Integrity Est. (%)", [0, 100]), use_container_width=True)
+    disp_val = abs(float(cg_shift.replace('mm', '')))
+    qual_pct = min(100, 100 * (1 - (predicted_class / 3) * 0.6))
+    gauges.add_trace(go.Indicator(mode="gauge+number", value=predicted_class, gauge={'axis': {'range': [0, 3]}, 'bar': {'color': gauge_color(predicted_class, [0, 3])}}), row=1, col=1)
+    gauges.add_trace(go.Indicator(mode="gauge+number", value=disp_val, gauge={'axis': {'range': [0, 15]}, 'bar': {'color': gauge_color(disp_val, [0, 15])}}), row=1, col=2)
+    gauges.add_trace(go.Indicator(mode="gauge+number", value=qual_pct, gauge={'axis': {'range': [0, 100]}, 'bar': {'color': gauge_color(qual_pct, [0, 100])}}), row=1, col=3)
+    gauges.update_layout(template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', height=210, margin=dict(l=10, r=10, t=36, b=10), font=dict(color="#CBD5E1", family="Inter"))
+    gauges.update_annotations(font=dict(family='Orbitron', size=12, color="#E8ECF5"))
+    st.plotly_chart(gauges, use_container_width=True, config={'displayModeBar': False})
 
 elif section == "🪐 3D Engineering Simulator":
     theme.section_hero("simulator", "3D Engineering Simulator", "Two synced tools: a gesture-controlled asset gallery (opt-in camera), and the live actuator digital twin driven by the AI's current command.")
