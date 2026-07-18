@@ -1,450 +1,422 @@
 """
-theme.py
-========
-COSMIC VECTOR — Visual theme engine, v3 (final).
+theme.py — Cosmic Vector visual system.
 
-What this module gives app.py:
-  1. build_base_css()        - fonts, transparent app shell, glass cards,
-                                 JARVIS-style sidebar (arc-reactor header),
-                                 toast + scroll-reveal CSS keyframes.
-  2. inject_space_background() - a REAL WebGL 3D scene (Three.js) reparented
-                                 behind the whole page: parallax starfield,
-                                 drifting nebula glow, slowly tumbling
-                                 asteroid meshes, a distant glowing sun --
-                                 not a flat CSS gradient. This is the actual
-                                 "3D live thing in the background".
-  3. inject_scroll_reveal()  - one-time IntersectionObserver so cards /
-                                 charts animate in as you scroll to them.
-  4. section_toast(icon, title) - a small animated popup shown once per
-                                 section switch (not every rerun).
-  5. jarvis_header()         - the animated arc-reactor sidebar header.
+Visual language adapted from a React/Tailwind landing-page spec into
+Streamlit's CSS/JS injection model (Streamlit can't run React components,
+so the *aesthetic* — fonts, liquid-glass cards, glow, scroll-progress
+parallax, staggered reveal — is reproduced here instead of ported literally):
+
+- Fonts: Dancing Script (brand wordmark), Instrument Serif italic (hero
+  heading + quote-style captions), Inter (body / UI text).
+- "Liquid-glass" card treatment: low-alpha blurred panels with a soft
+  gradient hairline border, instead of flat bordered boxes.
+- Text-glow on the hero title, button-glow on primary actions.
+- A scroll-progress-driven parallax background (lerp-smoothed, translate3d,
+  will-change: transform) layered under the existing animated starfield.
+- Scroll-reveal now staggers siblings in, instead of all popping at once.
 """
 
 import streamlit as st
 import streamlit.components.v1 as components
 
-ACCENTS = {
-    "briefing": "#38bdf8",
-    "telemetry": "#00E5FF",
-    "simulator": "#B388FF",
-    "solar": "#FFD700",
-    "validation": "#FF9933",
-    "logs": "#7DF9C1",
-}
+# ----------------------------------------------------------------------
+# Palette (single source of truth — change here, it changes everywhere)
+# ----------------------------------------------------------------------
+BG_BASE = "#05060f"
+BG_PANEL = "rgba(13, 16, 30, 0.35)"   # lower alpha -> true "liquid glass", not a flat card
+TEAL = "#5eead4"
+CYAN = "#38bdf8"
+VIOLET = "#a78bfa"
+AMBER = "#fbbf24"
+ROSE = "#fb7185"
+TEXT = "#eef2f7"
+MUTED = "#94a3b8"
+GOOD = "#34d399"
+WARN = "#f59e0b"
+BAD = "#fb4d4d"
 
 
 def build_css() -> str:
-    return """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Inter:wght@300;400;600;700&family=Roboto+Mono:wght@400;700&display=swap');
+    return f"""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Dancing+Script:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&family=Inter:wght@300;400;500;600;700;800;900&family=Orbitron:wght@400;600;700;900&family=Roboto+Mono:wght@400;500;700&display=swap');
 
-html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"],
-.main, .block-container {
-    background: transparent !important;
-}
-.stApp {
-    background: radial-gradient(ellipse 1200px 800px at 80% -10%, rgba(56,189,248,0.10), transparent 60%),
-                linear-gradient(180deg, #020617 0%, #0b1330 45%, #1e1b4b 100%) !important;
-    color: #F3F6FB !important;
-    font-family: 'Inter', sans-serif !important;
-    overflow-x: hidden;
-}
-[data-testid="stHeader"] { background: transparent !important; }
-#cv-space-host { position: fixed; inset: 0; z-index: -1; pointer-events: none; }
-
-/* ================= TYPOGRAPHY ================= */
-h1, h2, h3, h4 { font-family: 'Orbitron', sans-serif !important; color: #F3F6FB !important;
-    text-shadow: 0 2px 18px rgba(0,0,0,0.6); }
-.cv-title-gradient {
-    background: linear-gradient(90deg, #5eead4, #38bdf8 100%);
-    -webkit-background-clip: text; background-clip: text; color: transparent !important;
-    background-size: 140% auto; text-shadow: none !important;
-}
-.cv-kicker { font-family:'Roboto Mono',monospace; font-size: 10.5px; letter-spacing: 3px; color: #5eead4;
-    text-transform: uppercase; opacity: .85; }
-
-/* ================= GLASS CARDS (engineered HUD chrome, not a soft AI gradient card) ================= */
-.premium-card, .briefing-card {
-    background: linear-gradient(150deg, rgba(6,10,24,0.74), rgba(10,14,32,0.56)) !important;
-    backdrop-filter: blur(18px) saturate(140%);
-    -webkit-backdrop-filter: blur(18px) saturate(140%);
-    border: 1px solid rgba(148,197,255,0.14);
-    border-radius: 8px; padding: 20px 22px; margin-bottom: 20px;
-    box-shadow: 0 10px 34px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.05);
-    transition: transform .25s ease, box-shadow .25s ease, border-color .25s ease;
-    animation: cvFadeUp .55s ease both;
-    position: relative;
-}
-.premium-card::before, .premium-card::after, .briefing-card::before, .briefing-card::after {
-    content: ""; position: absolute; width: 12px; height: 12px; pointer-events: none; opacity: .55;
-}
-.premium-card::before, .briefing-card::before { top: -1px; left: -1px; border-top: 2px solid #5eead4; border-left: 2px solid #5eead4; }
-.premium-card::after, .briefing-card::after { bottom: -1px; right: -1px; border-bottom: 2px solid #5eead4; border-right: 2px solid #5eead4; }
-.premium-card:hover, .briefing-card:hover {
-    transform: translateY(-3px);
-    border-color: rgba(94,234,212,0.35);
-    box-shadow: 0 16px 44px rgba(0,0,0,0.55), 0 0 22px rgba(94,234,212,0.1);
-}
-.premium-card:hover::before, .premium-card:hover::after,
-.briefing-card:hover::before, .briefing-card:hover::after { opacity: 1; }
-.premium-card small { color: #9FB2CE; letter-spacing: 1.5px; font-size: 11px; font-family:'Roboto Mono',monospace; }
-.briefing-header { font-family:'Orbitron',sans-serif; color:#5eead4; margin-top:0; }
-@keyframes cvFadeUp { from { opacity:0; transform: translateY(18px); filter: blur(3px); } to { opacity:1; transform: translateY(0); filter: blur(0); } }
-
-[data-testid="stPlotlyChart"], [data-testid="stDataFrame"], iframe {
-    border-radius: 10px !important;
-    background: rgba(5,9,20,0.55) !important;
-    backdrop-filter: blur(10px);
-    border: 1px solid rgba(255,255,255,0.10);
-    padding: 6px;
-    animation: cvFadeUp .5s ease both;
-    transition: box-shadow .3s ease, transform .3s ease;
-}
-[data-testid="stPlotlyChart"]:hover { box-shadow: 0 0 28px rgba(0,229,255,0.16); }
-
-.emergency-active {
-    background: linear-gradient(135deg, rgba(255,23,68,.3), rgba(120,0,0,.4)) !important;
-    backdrop-filter: blur(14px);
-    border: 1px solid #FF1744 !important; border-radius: 20px; padding: 22px; text-align:center;
-    box-shadow: 0 0 44px rgba(255,23,68,.55); margin-bottom: 22px;
-    animation: cvAlarmFlash 1.6s ease-in-out infinite;
-}
-@keyframes cvAlarmFlash { 0%,100% { box-shadow: 0 0 30px rgba(255,23,68,.45); } 50% { box-shadow: 0 0 68px rgba(255,23,68,.9); } }
-
-.eval-pass { border: 2px solid #00FF7F !important; box-shadow: 0 0 18px rgba(0,255,127,0.3) !important; }
-.eval-fail { border: 2px solid #FF1744 !important; box-shadow: 0 0 18px rgba(255,23,68,0.3) !important; }
-
-.cv-caption { color: #D8E1F0; font-size: 12.5px; line-height:1.55; margin: 6px 0 10px 0;
-    border-left: 3px solid rgba(0,229,255,0.5); padding: 8px 12px;
-    background: rgba(0,229,255,0.05); border-radius: 0 8px 8px 0; animation: cvFadeUp .5s ease both; }
-
-.cv-live-chip { display:inline-flex; align-items:center; gap:7px; font-family:'Orbitron',sans-serif;
-     font-size: 11px; letter-spacing: 2px; color:#00FF7F; padding: 6px 14px; border-radius: 20px;
-     border: 1px solid rgba(0,255,127,0.4); background: rgba(0,20,10,0.45); backdrop-filter: blur(8px); }
-.cv-live-dot { width:7px; height:7px; border-radius:50%; background:#00FF7F; box-shadow:0 0 8px #00FF7F;
-     animation: cvPulseDot 1.4s ease-in-out infinite; }
-@keyframes cvPulseDot { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:.3; transform:scale(1.5); } }
-
-/* ================= BUTTONS ================= */
-.stButton > button {
-    background: linear-gradient(135deg, #00E5FF 0%, #7C4DFF 55%, #FFD700 100%) !important;
-    color:#040814 !important; font-family:'Orbitron',sans-serif !important; font-weight:900 !important;
-    border-radius: 12px !important; border: none !important; letter-spacing: 1px;
-    transition: transform .15s ease, box-shadow .15s ease;
-    box-shadow: 0 4px 14px rgba(0,0,0,0.4);
-}
-.stButton > button:hover { transform: translateY(-2px) scale(1.02); box-shadow: 0 8px 24px rgba(0,229,255,0.35); }
-
-/* ================= PILL NAV ================= */
-div[data-testid="stRadio"] > div {
-    flex-direction: row !important; gap: 8px; flex-wrap: wrap;
-    background: rgba(4,8,18,0.6); backdrop-filter: blur(14px);
-    border: 1px solid rgba(255,255,255,0.14); border-radius: 16px; padding: 9px; margin-bottom: 4px;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.35);
-}
-div[data-testid="stRadio"] label {
-    background: transparent; border-radius: 11px; padding: 9px 18px !important;
-    font-family:'Orbitron',sans-serif; font-size: 12.5px; transition: all .2s ease; border: 1px solid transparent;
-}
-div[data-testid="stRadio"] label:hover { background: rgba(0,229,255,0.1); border-color: rgba(0,229,255,0.3); }
-div[data-testid="stRadio"] label[data-checked="true"] {
-    background: linear-gradient(135deg, rgba(0,229,255,0.25), rgba(179,136,255,0.2)) !important;
-    border-color: rgba(0,229,255,0.55) !important; box-shadow: 0 0 16px rgba(0,229,255,0.28);
-}
-
-.cv-section { animation: cvFadeUp .45s ease both; }
-
-/* ================= HERO BANNERS ================= */
-.cv-hero {
-    display:flex; align-items:center; gap: 22px; padding: 22px 26px; margin-bottom: 22px;
-    border-radius: 20px; background: linear-gradient(120deg, rgba(4,8,18,0.72), rgba(4,8,18,0.42));
-    backdrop-filter: blur(16px); border: 1px solid rgba(255,255,255,0.14);
-    box-shadow: 0 12px 36px rgba(0,0,0,0.45); animation: cvFadeUp .5s ease both;
-    position: relative; overflow: hidden;
-}
-.cv-hero::after {
-    content:""; position:absolute; top:-40%; right:-10%; width: 260px; height:260px; border-radius:50%;
-    background: radial-gradient(circle, var(--cv-accent, #00E5FF) 0%, transparent 70%); opacity:.2; filter: blur(4px);
-}
-.cv-hero-icon { flex-shrink:0; width:64px; height:64px; }
-.cv-hero-text h2 { margin:0 0 4px 0; font-size: 1.5rem; }
-.cv-hero-text p { margin:0; color:#D8E1F0; font-size: 13.5px; max-width: 680px; line-height:1.5; }
-.cv-hero-bar { height:3px; width:64px; border-radius:3px; margin-top:10px; background: linear-gradient(90deg, var(--cv-accent, #00E5FF), transparent); }
-
-@keyframes cvOrbitSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-@keyframes cvFloatY { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
-@keyframes cvPulseGlow { 0%,100% { opacity:.7; } 50% { opacity:1; } }
-.cv-spin { animation: cvOrbitSpin 12s linear infinite; transform-origin: 50% 50%; }
-.cv-spin-slow { animation: cvOrbitSpin 22s linear infinite; transform-origin: 50% 50%; }
-.cv-float { animation: cvFloatY 3s ease-in-out infinite; }
-.cv-glow { animation: cvPulseGlow 2.2s ease-in-out infinite; }
-
-/* ================= JARVIS SIDEBAR ================= */
-[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, rgba(3,6,16,0.92), rgba(6,10,24,0.96)) !important;
-    backdrop-filter: blur(18px);
-    border-right: 1px solid rgba(0,229,255,0.18);
-    box-shadow: inset -1px 0 0 rgba(0,229,255,0.06);
-}
-[data-testid="stSidebar"]::before {
-    content:""; position:absolute; top:0; left:0; right:0; height:2px;
-    background: linear-gradient(90deg, transparent, #00E5FF, transparent);
-    animation: cvScan 3s linear infinite;
-}
-@keyframes cvScan { 0% { transform: translateY(0); opacity:.3; } 50% { opacity:1; } 100% { transform: translateY(600px); opacity:.3; } }
-
-.cv-reactor-wrap { display:flex; flex-direction:column; align-items:center; padding: 6px 0 14px 0; }
-.cv-reactor-ring1 { animation: cvOrbitSpin 6s linear infinite; transform-origin: 50% 50%; }
-.cv-reactor-ring2 { animation: cvOrbitSpin 9s linear infinite reverse; transform-origin: 50% 50%; }
-.cv-reactor-core { animation: cvPulseGlow 1.8s ease-in-out infinite; }
-.cv-reactor-label { font-family:'Orbitron',sans-serif; letter-spacing:3px; font-size:13px; color:#00E5FF;
-    margin-top: 6px; text-shadow: 0 0 10px rgba(0,229,255,0.6); }
-.cv-reactor-sub { font-family:'Roboto Mono',monospace; font-size: 9.5px; color:#5EEAD4; letter-spacing:1.5px; opacity:.8; }
-
-/* ================= TOAST (section-switch popup) ================= */
-#cv-toast-host { position: fixed; top: 22px; left: 50%; transform: translateX(-50%) translateY(-30px);
-    z-index: 999999; opacity: 0; pointer-events:none; transition: all .45s cubic-bezier(.2,.9,.25,1); }
-#cv-toast-host.show { opacity: 1; transform: translateX(-50%) translateY(0); }
-.cv-toast-card { display:flex; align-items:center; gap:12px; padding: 12px 22px; border-radius: 14px;
-    background: linear-gradient(120deg, rgba(4,10,24,0.92), rgba(10,16,36,0.85));
-    border: 1px solid rgba(0,229,255,0.4); backdrop-filter: blur(14px);
-    box-shadow: 0 12px 34px rgba(0,0,0,0.5), 0 0 24px rgba(0,229,255,0.25);
-    font-family:'Orbitron',sans-serif; color:#F3F6FB; font-size: 13px; letter-spacing: 1px; }
-
-/* ================= SCROLL REVEAL ================= */
-.cv-reveal-target { opacity: 0; transform: translateY(24px) scale(.985); transition: opacity .6s ease, transform .6s ease; }
-.cv-reveal-target.cv-in-view { opacity: 1; transform: translateY(0) scale(1); }
-
-::-webkit-scrollbar { width: 10px; }
-::-webkit-scrollbar-track { background: rgba(255,255,255,0.02); }
-::-webkit-scrollbar-thumb { background: rgba(0,229,255,0.3); border-radius: 6px; }
-</style>
-"""
-
-
-def inject_space_bg():
-    """
-    Real WebGL 3D background: parallax starfield across 3 depth layers, a slow
-    tumbling debris/asteroid field, soft nebula glow sprites, and a distant
-    glowing sun -- reparented out of the component iframe into the actual page
-    so it's a true fixed full-viewport backdrop (not a flat CSS gradient).
-    Idempotent: safe to call every rerun, it re-uses the same host + renderer
-    state via a guard flag on the parent window instead of rebuilding it.
-    """
-    html = """
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
-<script>
-(function() {
-  function boot() {
-    try {
-      const win = window.parent;
-      const doc = win.document;
-      if (win.__cvSpaceBooted) return;
-      win.__cvSpaceBooted = true;
-
-      let host = doc.getElementById('cv-space-host');
-      if (!host) { host = doc.createElement('div'); host.id = 'cv-space-host'; doc.body.prepend(host); }
-      const canvas = doc.createElement('canvas');
-      canvas.style.width = '100%'; canvas.style.height = '100%'; canvas.style.display = 'block';
-      host.appendChild(canvas);
-
-      const THREE = win.__cvTHREE || window.THREE;
-      const W = win.innerWidth, H = win.innerHeight;
-
-      const renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, alpha: true });
-      renderer.setPixelRatio(Math.min(win.devicePixelRatio || 1, 2));
-      renderer.setSize(W, H);
-
-      const scene = new THREE.Scene();
-      scene.fog = new THREE.FogExp2(0x03060f, 0.00028);
-      const camera = new THREE.PerspectiveCamera(60, W / H, 1, 6000);
-      camera.position.set(0, 0, 260);
-
-      function starLayer(count, spread, size, color, opacity) {
-        const geo = new THREE.BufferGeometry();
-        const pos = new Float32Array(count * 3);
-        for (let i = 0; i < count; i++) {
-          pos[i*3]   = (Math.random() - 0.5) * spread;
-          pos[i*3+1] = (Math.random() - 0.5) * spread;
-          pos[i*3+2] = (Math.random() - 0.5) * spread;
-        }
-        geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-        const mat = new THREE.PointsMaterial({ color, size, sizeAttenuation: true, transparent: true, opacity });
-        return new THREE.Points(geo, mat);
-      }
-      const layerFar = starLayer(1400, 3000, 1.4, 0xffffff, 0.75);
-      const layerMid = starLayer(500, 2000, 2.2, 0x8fd6ff, 0.85);
-      const layerNear = starLayer(140, 1200, 3.2, 0xffe9b3, 0.9);
-      scene.add(layerFar, layerMid, layerNear);
-
-      function glowSprite(hex, size, opacity) {
-        const c = doc.createElement('canvas'); c.width = c.height = 256;
-        const ctx = c.getContext('2d');
-        const g = ctx.createRadialGradient(128,128,0,128,128,128);
-        g.addColorStop(0, hex + 'FF'); g.addColorStop(0.4, hex + '66'); g.addColorStop(1, hex + '00');
-        ctx.fillStyle = g; ctx.fillRect(0,0,256,256);
-        const tex = new THREE.CanvasTexture(c);
-        const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, opacity, depthWrite: false });
-        const spr = new THREE.Sprite(mat); spr.scale.set(size, size, 1); return spr;
-      }
-      const nebula1 = glowSprite('#7C4DFF', 900, 0.10); nebula1.position.set(-500, 200, -900);
-      const nebula2 = glowSprite('#00C2E0', 800, 0.09); nebula2.position.set(600, -250, -1100);
-      scene.add(nebula1, nebula2);
-
-      const sun = glowSprite('#FFE9A8', 260, 0.55); sun.position.set(420, 260, -800);
-      const sunCore = glowSprite('#FFFFFF', 60, 0.9); sunCore.position.copy(sun.position);
-      scene.add(sun, sunCore);
-      scene.add(new THREE.PointLight(0xfff2cc, 1.2, 0, 0).translateX(420));
-      scene.add(new THREE.AmbientLight(0x223355, 0.9));
-
-      const asteroidMat = new THREE.MeshStandardMaterial({ color: 0x4b5563, roughness: 0.9, metalness: 0.2 });
-      const asteroids = [];
-      for (let i = 0; i < 10; i++) {
-        const geo = new THREE.IcosahedronGeometry(4 + Math.random() * 7, 0);
-        const pos = geo.attributes.position;
-        for (let v = 0; v < pos.count; v++) {
-          const jitter = 1 + (Math.random() - 0.5) * 0.35;
-          pos.setXYZ(v, pos.getX(v)*jitter, pos.getY(v)*jitter, pos.getZ(v)*jitter);
-        }
-        geo.computeVertexNormals();
-        const rock = new THREE.Mesh(geo, asteroidMat);
-        rock.position.set((Math.random()-0.5)*500, (Math.random()-0.5)*300, -100 - Math.random()*400);
-        rock.userData.spin = { x: (Math.random()-0.5)*0.006, y: (Math.random()-0.5)*0.006 };
-        rock.userData.drift = (Math.random()-0.5)*0.04;
-        scene.add(rock); asteroids.push(rock);
-      }
-
-      let t = 0;
-      function animate() {
-        t += 0.0035;
-        layerFar.rotation.y = t * 0.15;
-        layerMid.rotation.y = t * 0.3;
-        layerNear.rotation.y = t * 0.5;
-        camera.position.x = Math.sin(t * 0.4) * 22;
-        camera.position.y = Math.cos(t * 0.3) * 12;
-        camera.lookAt(0, 0, -300);
-        asteroids.forEach(r => {
-          r.rotation.x += r.userData.spin.x; r.rotation.y += r.userData.spin.y;
-          r.position.x += r.userData.drift;
-          if (r.position.x > 300) r.position.x = -300;
-          if (r.position.x < -300) r.position.x = 300;
-        });
-        renderer.render(scene, camera);
-        win.requestAnimationFrame(animate);
-      }
-      animate();
-
-      win.addEventListener('resize', () => {
-        const w = win.innerWidth, h = win.innerHeight;
-        camera.aspect = w / h; camera.updateProjectionMatrix();
-        renderer.setSize(w, h);
-      });
-    } catch (err) {
-      console.warn('Space background unavailable, CSS gradient fallback stays active:', err);
-    }
-  }
-  if (typeof THREE !== 'undefined') { boot(); }
-  else { window.addEventListener('load', () => setTimeout(boot, 250)); }
-})();
-</script>
-"""
-    components.html(html, height=1, width=1)
-
-
-def inject_scroll_reveal():
-    """One-time IntersectionObserver so cards/charts gently animate in as the
-    user scrolls to them, instead of the whole page just being static once
-    rendered. Idempotent via a guard flag on the parent window."""
-    html = """
-<script>
-(function() {
-  try {
-    const win = window.parent; const doc = win.document;
-    function attach() {
-      const targets = doc.querySelectorAll(
-        '.premium-card, .briefing-card, [data-testid="stPlotlyChart"], [data-testid="stDataFrame"], .cv-hero'
-      );
-      targets.forEach(el => el.classList.add('cv-reveal-target'));
-      if (!win.__cvObserver) {
-        win.__cvObserver = new win.IntersectionObserver((entries) => {
-          entries.forEach(e => { if (e.isIntersecting) e.target.classList.add('cv-in-view'); });
-        }, { threshold: 0.12 });
-      }
-      targets.forEach(el => { if (!el.classList.contains('cv-in-view')) win.__cvObserver.observe(el); });
-    }
-    attach();
-    if (!win.__cvRevealInterval) {
-      win.__cvRevealInterval = win.setInterval(attach, 900);
-    }
-  } catch (err) { /* no-op */ }
-})();
-</script>
-"""
-    components.html(html, height=1, width=1)
-
-
-def section_toast(icon: str, title: str):
-    """Shows a brief animated popup once per section change (caller is
-    responsible for only invoking this when the section actually changed)."""
-    html = f"""
-<script>
-(function() {{
-  try {{
-    const doc = window.parent.document;
-    let host = doc.getElementById('cv-toast-host');
-    if (!host) {{
-      host = doc.createElement('div'); host.id = 'cv-toast-host';
-      host.innerHTML = '<div class="cv-toast-card"><span style="font-size:20px;">{icon}</span><span>{title}</span></div>';
-      doc.body.appendChild(host);
-    }} else {{
-      host.querySelector('.cv-toast-card').innerHTML = '<span style="font-size:20px;">{icon}</span><span>{title}</span>';
+    html, body, .stApp {{
+        background: {BG_BASE} !important;
+        color: {TEXT} !important;
+        font-family: 'Inter', sans-serif !important;
+        overflow-x: hidden;
     }}
-    requestAnimationFrame(() => host.classList.add('show'));
-    clearTimeout(window.parent.__cvToastTimer);
-    window.parent.__cvToastTimer = setTimeout(() => host.classList.remove('show'), 1700);
-  }} catch (err) {{}}
-}})();
-</script>
-"""
-    components.html(html, height=1, width=1)
+
+    .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {{
+        background: transparent !important;
+    }}
+    [data-testid="stHeader"] {{ background: rgba(5,6,15,0.35) !important; backdrop-filter: blur(8px); }}
+    [data-testid="stSidebar"] {{
+        background: linear-gradient(180deg, rgba(9,11,24,0.86), rgba(5,6,15,0.92)) !important;
+        backdrop-filter: blur(10px);
+        border-right: 1px solid rgba(94,234,212,0.15);
+    }}
+
+    h1, h2, h3, h4 {{ font-family: 'Orbitron', sans-serif !important; color: {TEXT} !important; }}
+
+    ::-webkit-scrollbar {{ width: 8px; height: 8px; }}
+    ::-webkit-scrollbar-thumb {{ background: linear-gradient(180deg, {TEAL}, {VIOLET}); border-radius: 4px; }}
+    ::-webkit-scrollbar-track {{ background: transparent; }}
+
+    /* -------- Brand wordmark (Dancing Script) -------- */
+    .cv-brand-script {{
+        font-family: 'Dancing Script', cursive; font-weight: 700;
+        color: {TEXT}; letter-spacing: 0.5px;
+    }}
+
+    /* -------- Hero title: Instrument Serif italic + text-glow -------- */
+    .cv-title-gradient {{
+        font-family: 'Instrument Serif', serif; font-style: italic;
+        background: linear-gradient(90deg, {TEAL} 0%, {CYAN} 35%, {VIOLET} 68%, {AMBER} 100%);
+        -webkit-background-clip: text; background-clip: text; color: transparent !important;
+        font-weight: 400; letter-spacing: 0.5px;
+    }}
+    .cv-text-glow {{
+        text-shadow: 0 0 40px rgba(94,234,212,0.35), 0 0 80px rgba(167,139,250,0.2), 0 0 120px rgba(255,255,255,0.08);
+    }}
+
+    /* -------- Quote-style captions (Instrument Serif italic) -------- */
+    .cv-quote {{
+        font-family: 'Instrument Serif', serif; font-style: italic;
+        font-size: 1.15rem; color: {TEXT}; line-height: 1.6;
+    }}
+
+    .cv-live-chip {{
+        display: inline-flex; align-items: center; gap: 8px; margin-top: 10px;
+        background: rgba(94, 234, 212, 0.08); border: 1px solid rgba(94, 234, 212, 0.35);
+        color: {TEAL}; font-family: 'Roboto Mono', monospace; font-size: 11px; letter-spacing: 1.5px;
+        padding: 6px 14px; border-radius: 20px;
+    }}
+    .cv-live-dot {{ width: 8px; height: 8px; border-radius: 50%; background: {TEAL}; box-shadow: 0 0 8px {TEAL}; animation: cv-pulse 1.4s ease-in-out infinite; }}
+    @keyframes cv-pulse {{ 0%,100% {{ opacity: 1; transform: scale(1); }} 50% {{ opacity: .4; transform: scale(1.4); }} }}
+
+    /* -------- Liquid-glass panel treatment -------- */
+    .premium-card, .briefing-card, .cv-section-hero {{
+        background: {BG_PANEL} !important;
+        background-blend-mode: luminosity;
+        backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+        border: none !important;
+        box-shadow: inset 0 1px 1px rgba(255,255,255,0.1), 0 14px 34px rgba(0,0,0,0.5);
+        position: relative; overflow: hidden;
+        border-radius: 16px;
+    }}
+    .premium-card::before, .briefing-card::before, .cv-section-hero::before {{
+        content: ''; position: absolute; inset: 0; border-radius: inherit; padding: 1.4px;
+        background: linear-gradient(180deg,
+            rgba(94,234,212,0.5) 0%, rgba(167,139,250,0.18) 25%,
+            rgba(255,255,255,0) 45%, rgba(255,255,255,0) 60%,
+            rgba(251,191,36,0.18) 82%, rgba(94,234,212,0.5) 100%);
+        -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+        -webkit-mask-composite: xor; mask-composite: exclude;
+        pointer-events: none;
+    }}
+    .premium-card {{ padding: 18px 20px; margin-bottom: 18px; }}
+    .premium-card small {{ color: {MUTED}; letter-spacing: 1px; font-size: 11px; text-transform: uppercase; font-family: 'Roboto Mono', monospace; }}
+    .premium-card h3 {{ margin: 6px 0 0 0; color: {TEXT} !important; }}
+
+    .briefing-card {{ padding: 24px 26px; margin-bottom: 20px; }}
+    .briefing-header {{ color: {AMBER} !important; font-size: 1.3rem; margin-top: 0; font-family: 'Instrument Serif', serif; font-style: italic; font-weight: 400; }}
+
+    .cv-caption {{
+        font-size: 12.5px; color: {MUTED}; background: rgba(148,163,184,0.05);
+        backdrop-filter: blur(6px);
+        border-left: 2px solid {CYAN}; padding: 8px 12px; border-radius: 6px; margin: 6px 0 10px 0;
+    }}
+
+    .emergency-active {{
+        background: linear-gradient(135deg, rgba(251,77,77,.20), rgba(120,0,0,.26)) !important;
+        backdrop-filter: blur(10px);
+        border: 1px solid {BAD} !important; border-radius: 18px; padding: 22px; text-align: center;
+        box-shadow: 0 0 40px rgba(251,77,77,.5); margin-bottom: 22px; animation: alarm-flash 1.6s ease-in-out infinite;
+    }}
+    @keyframes alarm-flash {{ 0%,100% {{ box-shadow: 0 0 28px rgba(251,77,77,.4); }} 50% {{ box-shadow: 0 0 58px rgba(251,77,77,.8); }} }}
+
+    .eval-pass {{ border: 2px solid {GOOD} !important; box-shadow: 0 0 15px rgba(52,211,153,0.25) !important; }}
+    .eval-fail {{ border: 2px solid {BAD} !important; box-shadow: 0 0 15px rgba(251,77,77,0.25) !important; }}
+
+    /* -------- Buttons: button-glow -------- */
+    .stButton > button {{
+        background: linear-gradient(135deg, {TEAL} 0%, {CYAN} 55%, {VIOLET} 100%) !important;
+        color:#020617 !important; font-family:'Inter',sans-serif !important; font-weight:700 !important;
+        letter-spacing: 0.3px;
+        border: none !important; border-radius:999px !important;
+        box-shadow: 0 0 20px rgba(94,234,212,0.3), 0 0 40px rgba(167,139,250,0.12);
+        transition: transform .15s ease, box-shadow .15s ease;
+    }}
+    .stButton > button:hover {{
+        transform: translateY(-2px);
+        box-shadow: 0 0 26px rgba(94,234,212,0.45), 0 0 52px rgba(167,139,250,0.2);
+    }}
+
+    [data-testid="stRadio"] label {{ font-family: 'Inter', sans-serif; }}
+
+    /* -------- Section hero: liquid-glass + Instrument Serif heading -------- */
+    .cv-section-hero {{
+        padding: 22px 26px; margin: 6px 0 22px 0;
+        background: linear-gradient(120deg, rgba(94,234,212,0.08), rgba(167,139,250,0.06) 55%, rgba(251,191,36,0.05));
+    }}
+    .cv-section-hero h2 {{ margin: 0 0 4px 0; font-size: 1.9rem; font-family: 'Instrument Serif', serif; font-style: italic; font-weight: 400; }}
+    .cv-section-hero p {{ margin: 0; color: {MUTED}; font-size: 0.95rem; font-family: 'Inter', sans-serif; }}
+
+    /* -------- Scroll-reveal: hidden -> visible, staggered by JS (see inject_scroll_reveal) -------- */
+    .cv-reveal {{
+        opacity: 0; transform: translate3d(0, 28px, 0); will-change: transform, opacity;
+        transition: opacity .7s ease, transform .7s cubic-bezier(.2,.7,.3,1);
+    }}
+    .cv-reveal.cv-visible {{ opacity: 1; transform: translate3d(0,0,0); }}
+    </style>
+    """
 
 
-def jarvis_hud():
-    return """
-<div class="cv-reactor-wrap">
-  <svg width="86" height="86" viewBox="0 0 86 86">
-    <g class="cv-reactor-ring1"><circle cx="43" cy="43" r="38" stroke="#00E5FF" stroke-width="1.4" fill="none" stroke-dasharray="6 5" opacity=".8"/></g>
-    <g class="cv-reactor-ring2"><circle cx="43" cy="43" r="30" stroke="#B388FF" stroke-width="1.2" fill="none" stroke-dasharray="3 6" opacity=".7"/></g>
-    <circle cx="43" cy="43" r="19" fill="rgba(0,229,255,0.08)" stroke="#00E5FF" stroke-width="1"/>
-    <circle class="cv-reactor-core" cx="43" cy="43" r="10" fill="#00E5FF"/>
-    <circle cx="43" cy="43" r="4" fill="#FFFFFF"/>
-  </svg>
-  <div class="cv-reactor-label">J.A.R.V.I.S.</div>
-  <div class="cv-reactor-sub">MISSION INTERFACE ONLINE</div>
-</div>
-"""
-
-
-_ICONS = {
-    "briefing": """<svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="14" y="8" width="36" height="48" rx="3" stroke="#38bdf8" stroke-width="2" class="cv-float"/><line x1="20" y1="20" x2="44" y2="20" stroke="#38bdf8" stroke-width="2"/><line x1="20" y1="28" x2="44" y2="28" stroke="#38bdf8" stroke-width="1.5" opacity=".7"/><line x1="20" y1="36" x2="36" y2="36" stroke="#38bdf8" stroke-width="1.5" opacity=".7"/></svg>""",
-    "telemetry": """<svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="32" cy="32" r="6" fill="#00E5FF"/><g class="cv-spin"><ellipse cx="32" cy="32" rx="26" ry="10" stroke="#00E5FF" stroke-width="2" opacity=".7"/></g><g class="cv-spin-slow"><ellipse cx="32" cy="32" rx="26" ry="10" stroke="#FFD700" stroke-width="1.5" opacity=".5" transform="rotate(60 32 32)"/></g><circle cx="32" cy="32" r="26" stroke="#94A3B8" stroke-width="1" opacity=".25"/></svg>""",
-    "simulator": """<svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><g class="cv-float"><rect x="24" y="26" width="16" height="12" rx="2" fill="#B388FF"/><rect x="4" y="29" width="16" height="6" rx="1" fill="#00C2E0" opacity=".8"/><rect x="44" y="29" width="16" height="6" rx="1" fill="#00C2E0" opacity=".8"/><line x1="20" y1="32" x2="24" y2="32" stroke="#E2E8F0" stroke-width="2"/><line x1="40" y1="32" x2="44" y2="32" stroke="#E2E8F0" stroke-width="2"/><circle cx="32" cy="20" r="3" fill="#FFD700" class="cv-glow"/></g></svg>""",
-    "solar": """<svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="32" cy="32" r="12" fill="#FFD700" class="cv-glow"/><g class="cv-spin-slow" stroke="#FFD700" stroke-width="2" stroke-linecap="round"><line x1="32" y1="4" x2="32" y2="12"/><line x1="32" y1="52" x2="32" y2="60"/><line x1="4" y1="32" x2="12" y2="32"/><line x1="52" y1="32" x2="60" y2="32"/><line x1="12" y1="12" x2="18" y2="18"/><line x1="46" y1="46" x2="52" y2="52"/><line x1="12" y1="52" x2="18" y2="46"/><line x1="46" y1="18" x2="52" y2="12"/></g></svg>""",
-    "validation": """<svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="32" cy="32" r="24" stroke="#FF9933" stroke-width="1.5" opacity=".35"/><path d="M20 34 L27 26 L33 38 L40 22 L46 34" stroke="#FF9933" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round" class="cv-glow"/><circle cx="20" cy="34" r="2.4" fill="#00E5FF"/><circle cx="33" cy="38" r="2.4" fill="#00E5FF"/><circle cx="46" cy="34" r="2.4" fill="#00E5FF"/></svg>""",
-    "logs": """<svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><g class="cv-float"><ellipse cx="32" cy="18" rx="18" ry="7" fill="#7DF9C1" opacity=".85"/><path d="M14 18 V40 C14 44 50 44 50 40 V18" stroke="#7DF9C1" stroke-width="2" fill="none"/><ellipse cx="32" cy="29" rx="18" ry="7" stroke="#7DF9C1" stroke-width="1.5" fill="none" opacity=".6"/></g></svg>""",
-}
-
-
-def section_hero(kind: str, title: str, subtitle: str):
-    accent = ACCENTS.get(kind, "#00E5FF")
-    icon = _ICONS.get(kind, _ICONS["telemetry"])
-    st.markdown(f"""
-<div class="cv-hero" style="--cv-accent:{accent};">
-    <div class="cv-hero-icon">{icon}</div>
-    <div class="cv-hero-text">
-        <h2 class="cv-title-gradient">{title}</h2>
-        <p>{subtitle}</p>
-        <div class="cv-hero-bar"></div>
+def jarvis_hud() -> str:
+    """Sidebar HUD block. (Function name kept as jarvis_hud so app.py's
+    existing `theme.jarvis_hud()` call doesn't need to change — display
+    text now reads COSMIC, not JARVIS, everywhere.)"""
+    return f"""
+    <div style="text-align:center; padding: 4px 0 2px 0;">
+        <div class="cv-brand-script" style="font-size: 1.6rem; line-height:1;">Cosmic</div>
+        <h3 style="margin:2px 0 0 0; letter-spacing:2px;">COSMIC INTERFACE</h3>
+        <p style="color:{MUTED}; font-size:10.5px; letter-spacing:1.5px; margin:2px 0 0 0;">
+            AUTONOMOUS SPACECRAFT DEFENSE LINK
+        </p>
     </div>
-</div>
-""", unsafe_allow_html=True)
+    """
+
+
+def section_hero(section_id: str, title: str, subtitle: str) -> None:
+    accents = {
+        "briefing": (TEAL, "📖"), "telemetry": (CYAN, "📊"), "simulator": (VIOLET, "🪐"),
+        "solar": (AMBER, "🌐"), "validation": (ROSE, "🧠"), "logs": (MUTED, "🗄️"),
+    }
+    color, icon = accents.get(section_id, (TEAL, "🛰️"))
+    st.markdown(
+        f"""
+        <div class="cv-section-hero cv-reveal">
+            <h2 style="color:{TEXT} !important;">{icon} {title}</h2>
+            <p>{subtitle}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def section_toast(icon: str, name: str) -> None:
+    try:
+        st.toast(f"{name}", icon=icon)
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------------
+# Live animated space background + scroll-progress parallax.
+#
+# Two things layered on one <canvas>, pinned behind the Streamlit app:
+#  1. Time-based drift (nebula blobs + twinkling stars + shooting star) —
+#     unchanged from before, gives the "always alive" feel.
+#  2. Scroll-progress parallax — a soft aurora band whose vertical offset
+#     is driven by how far the page has scrolled (lerp-smoothed toward the
+#     target each frame, like the reference spec's rainbow/cloud layers),
+#     so the background visibly *responds* to scrolling instead of just
+#     sitting there. Pure 2D canvas on purpose: it must never compete for
+#     GPU/video-memory with the gesture simulator's WebGL context, which
+#     was the actual cause of the earlier black-screen crash.
+# ----------------------------------------------------------------------
+def inject_space_bg() -> None:
+    components.html(
+        """
+        <script>
+        (function() {
+            const doc = window.parent.document;
+            if (doc.getElementById('cv-space-bg')) return; // already injected, don't duplicate on rerun
+
+            const canvas = doc.createElement('canvas');
+            canvas.id = 'cv-space-bg';
+            canvas.style.position = 'fixed';
+            canvas.style.top = 0; canvas.style.left = 0;
+            canvas.style.width = '100vw'; canvas.style.height = '100vh';
+            canvas.style.zIndex = -1;
+            canvas.style.pointerEvents = 'none';
+            doc.body.prepend(canvas);
+
+            const ctx = canvas.getContext('2d');
+            let w, h, dpr;
+            function resize() {
+                dpr = Math.min(window.parent.devicePixelRatio || 1, 1.5);
+                w = canvas.width = window.parent.innerWidth * dpr;
+                h = canvas.height = window.parent.innerHeight * dpr;
+                canvas.style.width = window.parent.innerWidth + 'px';
+                canvas.style.height = window.parent.innerHeight + 'px';
+            }
+            resize();
+            window.parent.addEventListener('resize', resize);
+
+            const STAR_COLORS = ['#eef2f7', '#5eead4', '#a78bfa', '#38bdf8'];
+            // -- true 3D starfield: each star lives in (x,y,z) space centered on the
+            // viewer and drifts slowly toward the camera; projected to screen with a
+            // perspective divide (screen = focal * (world / z)). This is what gives
+            // real depth -- near stars sweep faster and grow bigger, far stars barely
+            // move -- rather than the flat 2D parallax trick used before. Kept on a
+            // 2D canvas (not WebGL) deliberately, so it never competes for GPU/video
+            // memory with the gesture simulator's WebGL context.
+            const STAR_COUNT = 320;
+            const FOCAL = 300;
+            const STAR_SPEED = 0.35; // slow, ambient drift -- not a "warp speed" effect
+            const stars3d = [];
+            function spawnStar(randomZ) {
+                return {
+                    x: (Math.random() - 0.5) * 2000,
+                    y: (Math.random() - 0.5) * 2000,
+                    z: randomZ ? Math.random() * 1000 + 1 : 1000,
+                    color: STAR_COLORS[Math.floor(Math.random() * STAR_COLORS.length)]
+                };
+            }
+            for (let i = 0; i < STAR_COUNT; i++) stars3d.push(spawnStar(true));
+
+            const nebulae = [
+                { cx: 0.2, cy: 0.25, r: 0.55, color: 'rgba(94,234,212,0.10)' },
+                { cx: 0.8, cy: 0.15, r: 0.5, color: 'rgba(167,139,250,0.09)' },
+                { cx: 0.55, cy: 0.75, r: 0.6, color: 'rgba(251,191,36,0.06)' },
+                { cx: 0.1, cy: 0.85, r: 0.4, color: 'rgba(56,189,248,0.08)' }
+            ];
+
+            // scroll-progress-driven aurora band (lerp-smoothed)
+            let auroraY = 0, auroraYTarget = 0;
+            function getScrollProgress() {
+                const doc2 = window.parent.document;
+                const scroller = doc2.querySelector('section.main') || doc2.scrollingElement || doc2.documentElement;
+                const scrollTop = scroller.scrollTop || window.parent.pageYOffset || 0;
+                const scrollHeight = Math.max(1, (scroller.scrollHeight || doc2.body.scrollHeight) - window.parent.innerHeight);
+                return Math.max(0, Math.min(1, scrollTop / scrollHeight));
+            }
+
+            let shooting = null;
+            let t = 0;
+
+            function maybeSpawnShootingStar() {
+                if (!shooting && Math.random() < 0.004) {
+                    shooting = {
+                        x: Math.random() * w, y: Math.random() * h * 0.4,
+                        vx: (Math.random() * 6 + 8), vy: (Math.random() * 3 + 3),
+                        life: 1.0
+                    };
+                }
+            }
+
+            function draw() {
+                t += 0.002;
+                ctx.clearRect(0, 0, w, h);
+
+                const g = ctx.createLinearGradient(0, 0, w, h);
+                g.addColorStop(0, '#070912');
+                g.addColorStop(0.5, '#0b0e1c');
+                g.addColorStop(1, '#050610');
+                ctx.fillStyle = g;
+                ctx.fillRect(0, 0, w, h);
+
+                // -- scroll-progress aurora band: target moves from +120 -> -160 (in css px * dpr) as you scroll, lerp factor 0.06 --
+                const progress = getScrollProgress();
+                auroraYTarget = (120 - progress * 280) * dpr;
+                auroraY += (auroraYTarget - auroraY) * 0.06;
+                const auroraGrad = ctx.createLinearGradient(0, auroraY, 0, auroraY + h * 0.5);
+                auroraGrad.addColorStop(0, 'rgba(94,234,212,0.12)');
+                auroraGrad.addColorStop(0.5, 'rgba(167,139,250,0.07)');
+                auroraGrad.addColorStop(1, 'rgba(251,191,36,0.0)');
+                ctx.fillStyle = auroraGrad;
+                ctx.fillRect(0, auroraY, w, h * 0.5);
+
+                nebulae.forEach((n, i) => {
+                    const cx = (n.cx + Math.sin(t + i) * 0.02) * w;
+                    const cy = (n.cy + Math.cos(t * 0.8 + i) * 0.02) * h;
+                    const rad = n.r * Math.max(w, h);
+                    const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, rad);
+                    grad.addColorStop(0, n.color);
+                    grad.addColorStop(1, 'rgba(0,0,0,0)');
+                    ctx.fillStyle = grad;
+                    ctx.fillRect(0, 0, w, h);
+                });
+
+                const cx0 = w / 2, cy0 = h / 2;
+                for (let i = 0; i < stars3d.length; i++) {
+                    const s = stars3d[i];
+                    s.z -= STAR_SPEED;
+                    if (s.z <= 1) { stars3d[i] = spawnStar(false); continue; }
+
+                    const scale = (FOCAL * dpr) / s.z;
+                    const px2 = cx0 + s.x * scale * 0.5;
+                    const py2 = cy0 + s.y * scale * 0.5;
+                    if (px2 < 0 || px2 > w || py2 < 0 || py2 > h) continue;
+
+                    const depthAlpha = Math.max(0, Math.min(1, 1 - s.z / 1000));
+                    const r = Math.max(0.3, scale * 0.9);
+                    ctx.globalAlpha = 0.25 + depthAlpha * 0.75;
+                    ctx.fillStyle = s.color;
+                    ctx.beginPath();
+                    ctx.arc(px2, py2, r, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+                ctx.globalAlpha = 1;
+
+                maybeSpawnShootingStar();
+                if (shooting) {
+                    ctx.strokeStyle = 'rgba(238,242,247,' + shooting.life + ')';
+                    ctx.lineWidth = 2 * dpr;
+                    ctx.beginPath();
+                    ctx.moveTo(shooting.x, shooting.y);
+                    ctx.lineTo(shooting.x - shooting.vx * 8, shooting.y - shooting.vy * 8);
+                    ctx.stroke();
+                    shooting.x += shooting.vx * dpr;
+                    shooting.y += shooting.vy * dpr;
+                    shooting.life -= 0.02;
+                    if (shooting.life <= 0 || shooting.x > w || shooting.y > h) shooting = null;
+                }
+
+                requestAnimationFrame(draw);
+            }
+            draw();
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
+
+def inject_scroll_reveal() -> None:
+    """Reveal .cv-reveal elements as they scroll into view, staggering
+    siblings the way the reference spec staggers its mobile-menu links
+    (~75ms apart) instead of every card popping in at once."""
+    components.html(
+        """
+        <script>
+        (function() {
+            const doc = window.parent.document;
+            function reveal() {
+                const vh = window.parent.innerHeight;
+                let staggerIndex = 0;
+                doc.querySelectorAll('.cv-reveal:not(.cv-visible)').forEach(el => {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.top < vh * 0.92) {
+                        const delay = Math.min(staggerIndex, 6) * 75;
+                        el.style.transitionDelay = delay + 'ms';
+                        el.classList.add('cv-visible');
+                        staggerIndex++;
+                    }
+                });
+            }
+            reveal();
+            const container = doc.querySelector('section.main') || doc.body;
+            container.addEventListener('scroll', reveal, { passive: true });
+            window.parent.addEventListener('scroll', reveal, { passive: true });
+            const mo = new MutationObserver(reveal);
+            mo.observe(doc.body, { childList: true, subtree: true });
+            setInterval(reveal, 400); // Streamlit reruns swap DOM nodes; keep checking
+        })();
+        </script>
+        """,
+        height=0,
+    )
