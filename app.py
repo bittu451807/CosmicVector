@@ -18,6 +18,7 @@ from sklearn.metrics import confusion_matrix
 from simulator_3d import show_3d_simulation
 from data_ingest import load_instrument_upload, sync_and_engineer, overlap_diagnostics
 import theme
+import cosmic_assistant
 
 # ==========================================
 # 0. SPATIAL COMPUTING FRONTEND (WEBGL + MEDIAPIPE GESTURE CONTROL)
@@ -752,6 +753,16 @@ if 'y_pred_hist' not in st.session_state: st.session_state.y_pred_hist = []
 if 'active_section' not in st.session_state: st.session_state.active_section = "📖 Mission Briefing"
 if 'xai_cache' not in st.session_state: st.session_state.xai_cache = {}
 if 'gesture_engine_loaded' not in st.session_state: st.session_state.gesture_engine_loaded = False
+if 'cosmic_chat' not in st.session_state: st.session_state.cosmic_chat = []
+if 'last_narrated_class' not in st.session_state: st.session_state.last_narrated_class = 0
+if 'incident_active' not in st.session_state: st.session_state.incident_active = False
+if 'incident_start_time' not in st.session_state: st.session_state.incident_start_time = None
+if 'incident_peak_class' not in st.session_state: st.session_state.incident_peak_class = 0
+if 'incident_peak_cg_shift' not in st.session_state: st.session_state.incident_peak_cg_shift = None
+if 'incident_reports' not in st.session_state: st.session_state.incident_reports = []
+if 'voice_narration_on' not in st.session_state: st.session_state.voice_narration_on = False
+if 'cosmic_voice_box' not in st.session_state: st.session_state.cosmic_voice_box = ''
+if '_clear_cosmic_box' not in st.session_state: st.session_state._clear_cosmic_box = False
 
 trapz_func = getattr(np, 'trapezoid', getattr(np, 'trapz', None))
 
@@ -770,6 +781,46 @@ DRIVE_FILE_IDS = {
     'solar_flare_gru.pt': None,
 }
 MIN_VALID_BYTES = 1024  # anything smaller than this is almost certainly an error page, not real data
+
+# ==========================================
+# GCS VOLUME MOUNT — set this to whatever mount path you used in Cloud Run's
+# "Volumes" -> "Volume Mounts" screen (Part 2 of the setup guide). If a file
+# is found here, it's used directly with ZERO download step -- this is what
+# actually fixes "have to re-upload after the app sleeps", since the bucket
+# is just always there, cold start or not. If nothing's mounted yet (e.g.
+# you haven't done the GCS setup), this quietly falls back to the Google
+# Drive auto-download path below, so nothing breaks in the meantime.
+# ==========================================
+GCS_MOUNT_PATH = "/mnt/data"
+
+
+def resolve_data_path(filename: str, drive_file_id) -> str:
+    """Prefer the GCS-mounted copy; fall back to the Drive-backed local copy."""
+    mounted_path = os.path.join(GCS_MOUNT_PATH, filename)
+    if os.path.exists(mounted_path) and os.path.getsize(mounted_path) > MIN_VALID_BYTES:
+        return mounted_path
+    local_path = os.path.join('data', filename)
+    ensure_data_file(local_path, drive_file_id)
+    return local_path
+
+# ==========================================
+# GEMINI API KEY — how to get one:
+#   1. Go to https://aistudio.google.com/apikey (sign in with any Google account)
+#   2. Click "Create API key" -> copy it (starts with "AIza...")
+#   3. NEVER paste it directly into this file or commit it to git. Instead:
+#      - Local dev: create `.streamlit/secrets.toml` in the project root with:
+#            GEMINI_API_KEY = "AIza...your key..."
+#        (add `.streamlit/secrets.toml` to .gitignore so it never gets pushed)
+#      - Cloud Run / cloud deploy: set it as an environment variable named
+#        GEMINI_API_KEY in the service's "Variables & Secrets" settings, or
+#        better, store it in Google Secret Manager and mount it as an env var.
+#   Ask Cosmic works with ZERO key configured -- it just falls back to the
+#   template-based answers instead of Gemini's free-form ones. Nothing breaks
+#   either way.
+# ==========================================
+def gemini_key_configured() -> bool:
+    return bool(cosmic_assistant.get_api_key())
+
 
 
 def _looks_like_html_error(path: str) -> bool:
@@ -852,9 +903,8 @@ class CosmicVectorModel(nn.Module):
 
 @st.cache_resource
 def load_ai_model():
-    ensure_data_file('data/solar_flare_gru.pt', DRIVE_FILE_IDS.get('solar_flare_gru.pt'))
+    model_path = resolve_data_path('solar_flare_gru.pt', DRIVE_FILE_IDS.get('solar_flare_gru.pt'))
     model = CosmicVectorModel()
-    model_path = 'data/solar_flare_gru.pt'
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location='cpu', weights_only=True))
     model.eval()
@@ -866,7 +916,9 @@ def load_ai_model():
 # ==========================================
 st.set_page_config(page_title="Aditya-L1 Tactical Command", layout="wide", initial_sidebar_state="expanded", page_icon="🛰️")
 st.markdown(theme.build_css(), unsafe_allow_html=True)
-theme.inject_space_bg()
+if 'space_bg_injected' not in st.session_state:
+    theme.inject_space_bg()
+    st.session_state.space_bg_injected = True
 
 
 def style_fig_dark(fig, title, y_title):
@@ -900,14 +952,33 @@ def reveal_card(inner_html):
     st.markdown(f"<div class='premium-card cv-reveal'>{inner_html}</div>", unsafe_allow_html=True)
 
 
+def speak_text(text: str):
+    """Speaks a line aloud using the browser's built-in SpeechSynthesis --
+    free, no API key, one-directional (Python -> browser) so it needs no
+    bridging trick. Escapes the text defensively since it's inlined into a
+    JS string literal."""
+    safe_text = json.dumps(text)
+    components.html(
+        f"""<script>
+        try {{
+            const utter = new SpeechSynthesisUtterance({safe_text});
+            utter.rate = 1.0; utter.pitch = 1.0;
+            window.parent.speechSynthesis.cancel();
+            window.parent.speechSynthesis.speak(utter);
+        }} catch (e) {{}}
+        </script>""",
+        height=0,
+    )
+
+
 # ==========================================
 # 4. DATA LOADING
 # ==========================================
 @st.cache_data
 def load_base_data():
-    ensure_data_file('data/dashboard_feed.csv', DRIVE_FILE_IDS.get('dashboard_feed.csv'))
-    if os.path.exists('data/dashboard_feed.csv') and os.path.getsize('data/dashboard_feed.csv') > MIN_VALID_BYTES:
-        d = pd.read_csv('data/dashboard_feed.csv', parse_dates=['time'])
+    csv_path = resolve_data_path('dashboard_feed.csv', DRIVE_FILE_IDS.get('dashboard_feed.csv'))
+    if os.path.exists(csv_path) and os.path.getsize(csv_path) > MIN_VALID_BYTES:
+        d = pd.read_csv(csv_path, parse_dates=['time'])
         d['time'] = pd.to_datetime(d['time'], utc=True)
         return d
     return None
@@ -1011,6 +1082,7 @@ pb1, pb2 = st.sidebar.columns(2)
 if pb1.button("▶️ INITIATE STREAM"): st.session_state.is_playing = True
 if pb2.button("⏸️ HALT STREAM"): st.session_state.is_playing = False
 playback_speed = st.sidebar.slider("Ping Rate (Frames Per Sec)", 1, 30, 10)
+st.sidebar.caption("Above ~12 fps, chart redraws auto-throttle to stay smooth — the data itself still streams at full speed.")
 
 if st.sidebar.button("⏭️ Jump to Next Alert/Critical Event", use_container_width=True):
     if df is not None and 'activity_level' in df.columns:
@@ -1027,6 +1099,11 @@ if st.sidebar.button("⏭️ Jump to Next Alert/Critical Event", use_container_w
 
 live_xai = st.sidebar.toggle("🧠 Live AI Explainability (XAI)", value=False,
                               help="Turn this on when parked in the AI Validation tab to see which telemetry features drove the AI's decision.")
+
+st.session_state.voice_narration_on = st.sidebar.toggle(
+    "🔊 Voice narration for alerts", value=st.session_state.voice_narration_on,
+    help="When a threat class rises to Monitor/Alert/Critical, Cosmic speaks a line aloud using your browser's built-in text-to-speech. No API key needed for this part."
+)
 
 if df is None:
     st.error("No valid data found. Upload payload or run backend scripts.")
@@ -1101,6 +1178,41 @@ mech_command = {"time": str(latest_tick['time']), "class": predicted_class, "shi
 with open("actuator_command.json", "w") as f:
     json.dump(mech_command, f)
 
+# ---- Proactive narration: speak only on an upward class transition, never
+# every tick, so it doesn't repeat itself into background noise. ----
+if predicted_class > st.session_state.last_narrated_class and st.session_state.voice_narration_on:
+    narration_lines = {
+        1: f"Monitor. Threat class {predicted_class}.",
+        2: f"Alert. Class {predicted_class} threat detected. Actuator commanding {cg_shift} C G shift.",
+        3: f"Critical. Class {predicted_class} threat detected. Maximum structural safe mode engaged.",
+    }
+    speak_text(narration_lines.get(predicted_class, f"Threat class now {predicted_class}, {status}."))
+st.session_state.last_narrated_class = predicted_class
+
+# ---- Incident tracking: opens when class first reaches Alert/Critical,
+# closes when it drops back below -- generates one auto mission-log entry
+# per incident via cosmic_assistant.generate_incident_report(). ----
+if predicted_class >= 2 and not st.session_state.incident_active:
+    st.session_state.incident_active = True
+    st.session_state.incident_start_time = str(latest_tick['time'])
+    st.session_state.incident_peak_class = predicted_class
+    st.session_state.incident_peak_cg_shift = cg_shift
+elif predicted_class >= 2 and st.session_state.incident_active:
+    if predicted_class > st.session_state.incident_peak_class:
+        st.session_state.incident_peak_class = predicted_class
+        st.session_state.incident_peak_cg_shift = cg_shift
+elif predicted_class < 2 and st.session_state.incident_active:
+    summary = {
+        "start_time": st.session_state.incident_start_time,
+        "end_time": str(latest_tick['time']),
+        "peak_class": st.session_state.incident_peak_class,
+        "peak_status": actions[st.session_state.incident_peak_class][0],
+        "peak_cg_shift": st.session_state.incident_peak_cg_shift,
+    }
+    report_text = cosmic_assistant.generate_incident_report(summary)
+    st.session_state.incident_reports.append(report_text)
+    st.session_state.incident_active = False
+
 # ==========================================
 # 7. DASHBOARD HEADER & AUDIO ALERT
 # ==========================================
@@ -1143,15 +1255,19 @@ with st.expander("ℹ️ What do these telemetry numbers indicate?"):
 # ==========================================
 # 8. SECTION NAV
 # ==========================================
+if st.session_state.get('_pending_section_switch'):
+    st.session_state.active_section = st.session_state._pending_section_switch
+    st.session_state._pending_section_switch = None
+
 section = st.radio(
     "section_nav",
-    ["📖 Mission Briefing", "📊 ISRO Telemetry", "🪐 3D Engineering Simulator", "🌐 NASA Solar View", "🧠 AI Validation", "🗄️ Mission Logs"],
+    ["📖 Mission Briefing", "📊 ISRO Telemetry", "🪐 3D Engineering Simulator", "🌐 NASA Solar View", "🧠 AI Validation", "💬 Ask Cosmic", "🗄️ Mission Logs"],
     horizontal=True, label_visibility="collapsed", key="active_section",
 )
 
 _section_icons = {
     "📖 Mission Briefing": "📖", "📊 ISRO Telemetry": "📊", "🪐 3D Engineering Simulator": "🪐",
-    "🌐 NASA Solar View": "🌐", "🧠 AI Validation": "🧠", "🗄️ Mission Logs": "🗄️",
+    "🌐 NASA Solar View": "🌐", "🧠 AI Validation": "🧠", "💬 Ask Cosmic": "💬", "🗄️ Mission Logs": "🗄️",
 }
 if st.session_state.get("_last_section") != section:
     theme.section_toast(_section_icons.get(section, "🛰️"), section.split(" ", 1)[-1])
@@ -1206,10 +1322,81 @@ if section == "📖 Mission Briefing":
 elif section == "📊 ISRO Telemetry":
     theme.section_hero("telemetry", "ISRO Telemetry — Dual-Channel Physics", "One synced combined timeline (never desyncs, because it's literally one figure sharing one x-axis) plus the two non-time-domain physics views below.")
 
-    # ---- combined, synced, WebGL-rendered timeline: channels + AI history share one x-axis ----
-    recent_n = min(len(window), len(st.session_state.y_pred_hist))
-    recent_preds = st.session_state.y_pred_hist[-recent_n:] if recent_n > 0 else []
-    recent_time = window['time'].iloc[-recent_n:] if recent_n > 0 else window['time']
+    # ---- Render-throttle: above ~10-12 redraws/sec a chart update is not
+    # perceptible anyway, but Plotly still pays the full rebuild+serialize
+    # cost every single tick. At high Ping Rates that cost is the #1 cause
+    # of a sluggish feel. Fix: only rebuild the heavy figures every Nth tick
+    # (N scales with playback_speed) and reuse the last-built figure the
+    # rest of the time -- nothing is removed, nothing goes blank, it just
+    # isn't rebuilt more often than a human can actually perceive. ----
+    render_stride = max(1, playback_speed // 12)
+    should_rebuild = (idx % render_stride == 0) or ('cached_combo_fig' not in st.session_state)
+
+    if should_rebuild:
+        recent_n = min(len(window), len(st.session_state.y_pred_hist))
+        recent_preds = st.session_state.y_pred_hist[-recent_n:] if recent_n > 0 else []
+        recent_time = window['time'].iloc[-recent_n:] if recent_n > 0 else window['time']
+
+        combo = make_subplots(
+            rows=2, cols=1, shared_xaxes=True, row_heights=[0.62, 0.38], vertical_spacing=0.05,
+            subplot_titles=("SoLEXS + HEL1OS — Dual-Channel Flux", "AI Threat Class (live, same window)"),
+        )
+        combo.add_trace(go.Scattergl(x=window["time"], y=window["soft_flux"], name="SoLEXS (soft)",
+                                      line=dict(color="#fb923c", width=2), fill='tozeroy', fillcolor='rgba(251,146,60,0.12)'), row=1, col=1)
+        combo.add_trace(go.Scattergl(x=window["time"], y=window["hard_flux"], name="HEL1OS (hard)",
+                                      line=dict(color="#5eead4", width=2)), row=1, col=1)
+        p50, p90, p99 = np.nanpercentile(df['soft_flux'].tail(2000).values, [50, 90, 99]) if len(df) > 5 else (0, 0, 0)
+        for val, lbl, clr in zip([p50, p90, p99], ["Background", "Elevated", "Severe"], ["#34d399", "#fbbf24", "#fb4d4d"]):
+            combo.add_hline(y=val, line_dash="dot", line_color=clr, opacity=0.5, row=1, col=1,
+                             annotation_text=lbl, annotation_font_size=9, annotation_font_color=clr)
+
+        combo.add_trace(go.Scattergl(x=recent_time, y=recent_preds, mode='lines', line=dict(color="#a78bfa", width=2, shape='hv'),
+                                      name="AI Class", showlegend=False), row=2, col=1)
+        for yv, lbl in [(1, "Monitor"), (2, "Alert"), (3, "Critical")]:
+            combo.add_hline(y=yv, line_dash="dot", line_color="rgba(255,255,255,0.18)", row=2, col=1,
+                             annotation_text=lbl, annotation_font_size=9, annotation_font_color="#94a3b8")
+
+        if len(window) > 0:
+            combo.add_vline(x=window["time"].iloc[-1], line_color="#eef2f7", line_width=1, opacity=0.55, row="all", col="all")
+
+        combo.update_layout(
+            template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+            font=dict(color="#CBD5E1", family="Inter"), margin=dict(l=10, r=10, t=42, b=10),
+            hovermode="x unified", height=560, showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.06, x=0, bgcolor="rgba(0,0,0,0)"),
+        )
+        combo.update_yaxes(gridcolor='rgba(255,255,255,0.05)', title_text="Flux", row=1, col=1)
+        combo.update_yaxes(gridcolor='rgba(255,255,255,0.05)', title_text="Class (0-3)", range=[-0.3, 3.3], row=2, col=1)
+        combo.update_xaxes(gridcolor='rgba(255,255,255,0.05)')
+        combo.update_annotations(font=dict(family='Orbitron', size=13, color="#E8ECF5"))
+
+        yf = rfft(window['soft_flux'].fillna(0).values - np.mean(window['soft_flux'].fillna(0).values)) if len(window) > 0 else [0]
+        xf = rfftfreq(len(window), 1.0) if len(window) > 0 else [0]
+        fig_qpp = go.Figure(go.Scattergl(x=xf, y=np.abs(yf) ** 2, mode='lines', line=dict(color="#fb4d4d", width=2), fill='tozeroy', fillcolor='rgba(251,77,77,0.1)'))
+        fig_qpp = style_fig_dark(fig_qpp, "QPP Spectral FFT (Magnetic Heartbeat)", "Power")
+
+        fig_phase = px.scatter(window, x="hard_flux", y="heating_slope", color="soft_flux",
+                                color_continuous_scale=["#34d399", "#fb923c", "#fb4d4d"], render_mode='webgl')
+        fig_phase = style_fig_dark(fig_phase, "Flare Loop (Phase-Space Map)", "Heating Speed (dΦ/dt)")
+
+        gauges = make_subplots(rows=1, cols=3, specs=[[{'type': 'domain'}, {'type': 'domain'}, {'type': 'domain'}]],
+                                subplot_titles=("Threat Class", "Displacement (mm)", "Structural Integrity Est. (%)"))
+
+        def gauge_color(val, rng):
+            return "#34d399" if val < rng[1] * 0.3 else "#fbbf24" if val < rng[1] * 0.7 else "#fb4d4d"
+
+        disp_val = abs(float(cg_shift.replace('mm', '')))
+        qual_pct = min(100, 100 * (1 - (predicted_class / 3) * 0.6))
+        gauges.add_trace(go.Indicator(mode="gauge+number", value=predicted_class, gauge={'axis': {'range': [0, 3]}, 'bar': {'color': gauge_color(predicted_class, [0, 3])}}), row=1, col=1)
+        gauges.add_trace(go.Indicator(mode="gauge+number", value=disp_val, gauge={'axis': {'range': [0, 15]}, 'bar': {'color': gauge_color(disp_val, [0, 15])}}), row=1, col=2)
+        gauges.add_trace(go.Indicator(mode="gauge+number", value=qual_pct, gauge={'axis': {'range': [0, 100]}, 'bar': {'color': gauge_color(qual_pct, [0, 100])}}), row=1, col=3)
+        gauges.update_layout(template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', height=210, margin=dict(l=10, r=10, t=36, b=10), font=dict(color="#CBD5E1", family="Inter"))
+        gauges.update_annotations(font=dict(family='Orbitron', size=12, color="#E8ECF5"))
+
+        st.session_state.cached_combo_fig = combo
+        st.session_state.cached_qpp_fig = fig_qpp
+        st.session_state.cached_phase_fig = fig_phase
+        st.session_state.cached_gauges_fig = gauges
 
     info_caption(
         "<b>Combined Telemetry &amp; AI Threat Timeline</b> — SoLEXS (soft X-ray, amber) and HEL1OS "
@@ -1218,68 +1405,18 @@ elif section == "📊 ISRO Telemetry":
         "bands from this mission's own data distribution. The vertical marker is <i>now</i> — the same "
         "tick driving the KPI cards above."
     )
-    combo = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, row_heights=[0.62, 0.38], vertical_spacing=0.05,
-        subplot_titles=("SoLEXS + HEL1OS — Dual-Channel Flux", "AI Threat Class (live, same window)"),
-    )
-    combo.add_trace(go.Scattergl(x=window["time"], y=window["soft_flux"], name="SoLEXS (soft)",
-                                  line=dict(color="#fb923c", width=2), fill='tozeroy', fillcolor='rgba(251,146,60,0.12)'), row=1, col=1)
-    combo.add_trace(go.Scattergl(x=window["time"], y=window["hard_flux"], name="HEL1OS (hard)",
-                                  line=dict(color="#5eead4", width=2)), row=1, col=1)
-    p50, p90, p99 = np.nanpercentile(df['soft_flux'].tail(2000).values, [50, 90, 99]) if len(df) > 5 else (0, 0, 0)
-    for val, lbl, clr in zip([p50, p90, p99], ["Background", "Elevated", "Severe"], ["#34d399", "#fbbf24", "#fb4d4d"]):
-        combo.add_hline(y=val, line_dash="dot", line_color=clr, opacity=0.5, row=1, col=1,
-                         annotation_text=lbl, annotation_font_size=9, annotation_font_color=clr)
-
-    combo.add_trace(go.Scattergl(x=recent_time, y=recent_preds, mode='lines', line=dict(color="#a78bfa", width=2, shape='hv'),
-                                  name="AI Class", showlegend=False), row=2, col=1)
-    for yv, lbl in [(1, "Monitor"), (2, "Alert"), (3, "Critical")]:
-        combo.add_hline(y=yv, line_dash="dot", line_color="rgba(255,255,255,0.18)", row=2, col=1,
-                         annotation_text=lbl, annotation_font_size=9, annotation_font_color="#94a3b8")
-
-    if len(window) > 0:
-        combo.add_vline(x=window["time"].iloc[-1], line_color="#eef2f7", line_width=1, opacity=0.55, row="all", col="all")
-
-    combo.update_layout(
-        template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-        font=dict(color="#CBD5E1", family="Inter"), margin=dict(l=10, r=10, t=42, b=10),
-        hovermode="x unified", height=560, showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.06, x=0, bgcolor="rgba(0,0,0,0)"),
-    )
-    combo.update_yaxes(gridcolor='rgba(255,255,255,0.05)', title_text="Flux", row=1, col=1)
-    combo.update_yaxes(gridcolor='rgba(255,255,255,0.05)', title_text="Class (0-3)", range=[-0.3, 3.3], row=2, col=1)
-    combo.update_xaxes(gridcolor='rgba(255,255,255,0.05)')
-    combo.update_annotations(font=dict(family='Orbitron', size=13, color="#E8ECF5"))
-    st.plotly_chart(combo, use_container_width=True, config={'displayModeBar': False})
+    st.plotly_chart(st.session_state.cached_combo_fig, use_container_width=True, config={'displayModeBar': False})
 
     fft_col, phase_col = st.columns(2)
     with fft_col:
         info_caption("<b>QPP Spectral FFT</b> — a clear peak means the flare is releasing energy in a periodic 'heartbeat' (Quasi-Periodic Pulsation), not one smooth burst.")
-        yf = rfft(window['soft_flux'].fillna(0).values - np.mean(window['soft_flux'].fillna(0).values)) if len(window) > 0 else [0]
-        xf = rfftfreq(len(window), 1.0) if len(window) > 0 else [0]
-        fig_qpp = go.Figure(go.Scattergl(x=xf, y=np.abs(yf) ** 2, mode='lines', line=dict(color="#fb4d4d", width=2), fill='tozeroy', fillcolor='rgba(251,77,77,0.1)'))
-        st.plotly_chart(style_fig_dark(fig_qpp, "QPP Spectral FFT (Magnetic Heartbeat)", "Power"), use_container_width=True, config={'displayModeBar': False})
+        st.plotly_chart(st.session_state.cached_qpp_fig, use_container_width=True, config={'displayModeBar': False})
     with phase_col:
         info_caption("<b>Phase-Space Loop</b> — Heating Speed vs. Hard Flux, coloured by Soft Flux. A closed loop here (not a random scatter) is a quick sanity-check that this is physics, not sensor noise.")
-        fig_phase = px.scatter(window, x="hard_flux", y="heating_slope", color="soft_flux",
-                                color_continuous_scale=["#34d399", "#fb923c", "#fb4d4d"], render_mode='webgl')
-        st.plotly_chart(style_fig_dark(fig_phase, "Flare Loop (Phase-Space Map)", "Heating Speed (dΦ/dt)"), use_container_width=True, config={'displayModeBar': False})
+        st.plotly_chart(st.session_state.cached_phase_fig, use_container_width=True, config={'displayModeBar': False})
 
     st.markdown("### Core Systems Gauges")
-    gauges = make_subplots(rows=1, cols=3, specs=[[{'type': 'domain'}, {'type': 'domain'}, {'type': 'domain'}]],
-                            subplot_titles=("Threat Class", "Displacement (mm)", "Structural Integrity Est. (%)"))
-
-    def gauge_color(val, rng):
-        return "#34d399" if val < rng[1] * 0.3 else "#fbbf24" if val < rng[1] * 0.7 else "#fb4d4d"
-
-    disp_val = abs(float(cg_shift.replace('mm', '')))
-    qual_pct = min(100, 100 * (1 - (predicted_class / 3) * 0.6))
-    gauges.add_trace(go.Indicator(mode="gauge+number", value=predicted_class, gauge={'axis': {'range': [0, 3]}, 'bar': {'color': gauge_color(predicted_class, [0, 3])}}), row=1, col=1)
-    gauges.add_trace(go.Indicator(mode="gauge+number", value=disp_val, gauge={'axis': {'range': [0, 15]}, 'bar': {'color': gauge_color(disp_val, [0, 15])}}), row=1, col=2)
-    gauges.add_trace(go.Indicator(mode="gauge+number", value=qual_pct, gauge={'axis': {'range': [0, 100]}, 'bar': {'color': gauge_color(qual_pct, [0, 100])}}), row=1, col=3)
-    gauges.update_layout(template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', height=210, margin=dict(l=10, r=10, t=36, b=10), font=dict(color="#CBD5E1", family="Inter"))
-    gauges.update_annotations(font=dict(family='Orbitron', size=12, color="#E8ECF5"))
-    st.plotly_chart(gauges, use_container_width=True, config={'displayModeBar': False})
+    st.plotly_chart(st.session_state.cached_gauges_fig, use_container_width=True, config={'displayModeBar': False})
 
 elif section == "🪐 3D Engineering Simulator":
     theme.section_hero("simulator", "3D Engineering Simulator", "Two synced tools: a gesture-controlled asset gallery (opt-in camera), and the live actuator digital twin driven by the AI's current command.")
@@ -1366,20 +1503,158 @@ elif section == "🧠 AI Validation":
     fig_rad.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 0.4])), template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
     st.plotly_chart(fig_rad, use_container_width=True)
 
+elif section == "💬 Ask Cosmic":
+    theme.section_hero(
+        "validation", "Ask Cosmic",
+        "Talk to the mission AI directly — type or use the mic. Commands like \"pause the stream\", "
+        "\"next alert\", or \"switch to telemetry\" run instantly; anything else gets answered from the "
+        "exact live telemetry on screen right now."
+    )
+
+    if st.session_state.is_playing:
+        st.warning(
+            "⏸️ **Auto-stream paused on this tab.** A mid-conversation rerun would cut off a reply "
+            "before you could read it. Streaming resumes the moment you switch tabs, or hit HALT / "
+            "INITIATE again from here."
+        )
+
+    if gemini_key_configured():
+        st.success("🟢 Gemini connected — free-form questions get a real generated answer, grounded in the live numbers on screen.")
+    else:
+        st.info(
+            "🔌 No Gemini API key configured yet — Ask Cosmic is running on deterministic template "
+            "answers only (status / why / forecast / compare questions all still work). See the "
+            "`GEMINI API KEY` comment block near the top of `app.py` for the 2-minute setup guide — "
+            "it's free and nothing here breaks without it."
+        )
+
+    if st.session_state.get('_clear_cosmic_box'):
+        st.session_state.cosmic_voice_box = ''
+        st.session_state._clear_cosmic_box = False
+
+    mic_col, input_col, btn_col = st.columns([0.10, 0.74, 0.16])
+    with mic_col:
+        components.html(
+            """
+            <div style="display:flex; align-items:center; justify-content:center; height:44px;">
+            <button id="cv-mic-btn" style="width:42px;height:42px;border-radius:50%;border:1px solid #5eead4;
+                background:rgba(94,234,212,0.1);color:#5eead4;font-size:18px;cursor:pointer;">🎙️</button>
+            </div>
+            <script>
+            (function() {
+                const btn = document.getElementById('cv-mic-btn');
+                const SpeechRec = window.webkitSpeechRecognition || window.SpeechRecognition;
+                if (!SpeechRec) { btn.title = "Voice input not supported in this browser -- type instead."; btn.style.opacity = 0.4; return; }
+                const rec = new SpeechRec();
+                rec.lang = 'en-IN'; rec.interimResults = false; rec.maxAlternatives = 1;
+
+                rec.onresult = (e) => {
+                    const transcript = e.results[0][0].transcript;
+                    const doc = window.parent.document;
+                    const target = Array.from(doc.querySelectorAll('input[type="text"]'))
+                        .find(el => (el.placeholder || '').includes('Type your question'));
+                    if (target) {
+                        const setter = Object.getOwnPropertyDescriptor(window.parent.HTMLInputElement.prototype, 'value').set;
+                        setter.call(target, transcript);
+                        target.dispatchEvent(new Event('input', { bubbles: true }));
+                        target.blur(); // nudges Streamlit to commit the value
+                    }
+                    btn.style.background = 'rgba(94,234,212,0.1)';
+                };
+                rec.onerror = () => { btn.style.background = 'rgba(251,77,77,0.15)'; };
+                btn.onclick = () => { btn.style.background = 'rgba(251,191,36,0.25)'; try { rec.start(); } catch(e) {} };
+            })();
+            </script>
+            """,
+            height=60,
+        )
+    with input_col:
+        st.text_input("cosmic_input", key="cosmic_voice_box", label_visibility="collapsed",
+                       placeholder="Type your question, or tap the mic and speak...")
+    with btn_col:
+        ask_clicked = st.button("Ask →", use_container_width=True)
+
+    info_caption(
+        "If the mic doesn't auto-submit on your browser, the transcript still lands in the text box — "
+        "just press Enter or click <b>Ask →</b>. Mic access is opt-in (only requested when you tap it), same as the gesture engine."
+    )
+
+    if ask_clicked and st.session_state.cosmic_voice_box.strip():
+        user_q = st.session_state.cosmic_voice_box.strip()
+        command = cosmic_assistant.parse_voice_command(user_q)
+
+        if command:
+            st.session_state.cosmic_chat.append({"role": "user", "text": user_q})
+            st.session_state.cosmic_chat.append({"role": "assistant", "text": command["label"]})
+            if command["action"] == "pause":
+                st.session_state.is_playing = False
+            elif command["action"] == "play":
+                st.session_state.is_playing = True
+            elif command["action"] == "jump_next_event" and 'activity_level' in df.columns:
+                future_hits = df[(df.index > idx) & (df['activity_level'] >= 2)]
+                if not future_hits.empty:
+                    st.session_state.current_index = int(future_hits.index[0])
+                    st.session_state.stop_index = None
+                    st.session_state.y_true_hist, st.session_state.y_pred_hist = [], []
+            elif command["action"] == "switch_tab":
+                st.session_state._pending_section_switch = command["target"]
+            if st.session_state.voice_narration_on:
+                speak_text(command["label"])
+        else:
+            cache_val = st.session_state.xai_cache.get(idx)
+            xai_scores_for_chat = cache_val if cache_val is not None else None
+            xai_features_for_chat = features if cache_val is not None else None
+            ctx = cosmic_assistant.build_context(df, idx, window, predicted_class, status, cg_shift,
+                                                  forecast_class, forecast_status, xai_scores_for_chat, xai_features_for_chat)
+            hist_ctx = cosmic_assistant.get_historical_comparison(df, idx)
+            with st.spinner("Cosmic is thinking..."):
+                answer = cosmic_assistant.generate_answer(user_q, ctx, hist_ctx)
+            st.session_state.cosmic_chat.append({"role": "user", "text": user_q})
+            st.session_state.cosmic_chat.append({"role": "assistant", "text": answer})
+            if st.session_state.voice_narration_on:
+                speak_text(answer)
+
+        st.session_state._clear_cosmic_box = True
+        st.rerun()
+
+    st.markdown("#### Conversation")
+    if not st.session_state.cosmic_chat:
+        st.caption("No questions yet — try \"what's the status\", \"why this class\", \"what's the forecast\", or a command like \"pause the stream\".")
+    for msg in st.session_state.cosmic_chat[-20:]:
+        with st.chat_message("user" if msg["role"] == "user" else "assistant"):
+            st.write(msg["text"])
+
+    if st.session_state.cosmic_chat and st.button("🗑️ Clear conversation"):
+        st.session_state.cosmic_chat = []
+        st.rerun()
+
 elif section == "🗄️ Mission Logs":
     theme.section_hero("logs", "Mission Logs", "Raw synced telemetry, exactly as the AI sees it — download to verify any number by hand.")
+
+    info_caption(
+        "<b>Auto-Generated Incident Reports</b> — Cosmic writes one of these automatically whenever a "
+        "threat class rises to Alert/Critical and then drops back down, no operator input needed."
+    )
+    if st.session_state.incident_reports:
+        for i, rep in enumerate(reversed(st.session_state.incident_reports[-10:])):
+            reveal_card(f"<small>INCIDENT #{len(st.session_state.incident_reports) - i}</small><p style='margin-top:6px; color:#e8ecf5; line-height:1.5;'>{rep}</p>")
+    else:
+        st.info("No Alert/Critical incidents have opened and closed yet this session — this fills in automatically as the stream plays.")
+
     info_caption("Raw numerical datastream logs for the last 100 ticks up to the current playhead. Download the full CSV up to this point for manual verification.")
     st.dataframe(df.head(idx).tail(100), use_container_width=True)
     st.download_button("💾 DOWNLOAD CSV", data=df.head(idx).to_csv(index=False).encode('utf-8'), file_name="aditya_l1_log.csv", mime="text/csv")
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-theme.inject_scroll_reveal()
+if 'scroll_reveal_injected' not in st.session_state:
+    theme.inject_scroll_reveal()
+    st.session_state.scroll_reveal_injected = True
 
 # ==========================================
 # 9. STREAMING ENGINE (SMOOTH FPS, PAUSED ON THE 3D SIMULATOR TAB)
 # ==========================================
-if st.session_state.is_playing and section != "🪐 3D Engineering Simulator":
+if st.session_state.is_playing and section not in ("🪐 3D Engineering Simulator", "💬 Ask Cosmic"):
     target_stop = st.session_state.stop_index if st.session_state.stop_index else len(df) - 1
     if st.session_state.current_index < target_stop:
         st.session_state.current_index += 1
