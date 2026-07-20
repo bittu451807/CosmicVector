@@ -1,10 +1,12 @@
-streamlit>=1.36
+streamlit>=1.38
 pandas
 numpy
 torch
-captum
 plotly
+pydeck
 scipy
 scikit-learn
-astropy
+captum
 gdown
+google-generativeai
+astropy
