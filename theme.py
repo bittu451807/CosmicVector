@@ -170,20 +170,34 @@ def build_css() -> str:
         transition: opacity .7s ease, transform .7s cubic-bezier(.2,.7,.3,1);
     }}
     .cv-reveal.cv-visible {{ opacity: 1; transform: translate3d(0,0,0); }}
+
+    /* -------- Professional chart framing: every Plotly chart gets the same
+       liquid-glass treatment as the cards, so graphs read as part of the
+       dashboard instead of bare plots dropped on a black background -------- */
+    [data-testid="stPlotlyChart"] {{
+        background: {BG_PANEL} !important;
+        backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+        border-radius: 16px; padding: 10px 6px 4px 6px;
+        box-shadow: inset 0 1px 1px rgba(255,255,255,0.08), 0 10px 28px rgba(0,0,0,0.45);
+        border: 1px solid rgba(148,163,184,0.10);
+        margin-bottom: 14px;
+    }}
+    [data-testid="stDataFrame"] {{
+        border-radius: 14px !important; overflow: hidden;
+        border: 1px solid rgba(148,163,184,0.15) !important;
+    }}
     </style>
     """
 
 
 def jarvis_hud() -> str:
     """Sidebar HUD block. (Function name kept as jarvis_hud so app.py's
-    existing `theme.jarvis_hud()` call doesn't need to change — display
-    text now reads COSMIC, not JARVIS, everywhere.)"""
+    existing `theme.jarvis_hud()` call doesn't need to change.)"""
     return f"""
     <div style="text-align:center; padding: 4px 0 2px 0;">
-        <div class="cv-brand-script" style="font-size: 1.6rem; line-height:1;">Cosmic</div>
-        <h3 style="margin:2px 0 0 0; letter-spacing:2px;">COSMIC INTERFACE</h3>
-        <p style="color:{MUTED}; font-size:10.5px; letter-spacing:1.5px; margin:2px 0 0 0;">
-            AUTONOMOUS SPACECRAFT DEFENSE LINK
+        <div class="cv-brand-script" style="font-size: 1.9rem; line-height:1;">Cosmic Interface</div>
+        <p style="color:{MUTED}; font-size:10.5px; letter-spacing:1.5px; margin:6px 0 0 0; text-transform:uppercase;">
+            Autonomous Spacecraft Defense Link
         </p>
     </div>
     """
