@@ -1007,6 +1007,26 @@ model = load_ai_model()
 # 5. SIDEBAR — J.A.R.V.I.S. HUD + MECHANICS
 # ==========================================
 st.sidebar.markdown(theme.jarvis_hud(), unsafe_allow_html=True)
+
+# ---- TEMPORARY DIAGNOSTIC PANEL ----
+# Shows exactly what this running container sees on disk, so we can find the
+# real mismatch (wrong path, wrong working directory, ignored file, stale
+# deploy) instead of guessing. Safe to delete once the file issue is fixed.
+with st.sidebar.expander("🔍 Data File Diagnostics", expanded=True):
+    st.code(f"Working directory: {os.getcwd()}")
+    for check_path in ["data/dashboard_feed.csv", "dashboard_feed.csv", os.path.join(GCS_MOUNT_PATH, "dashboard_feed.csv")]:
+        exists = os.path.exists(check_path)
+        size = os.path.getsize(check_path) if exists else 0
+        st.write(f"`{check_path}` → {'✅ found' if exists else '❌ missing'}"
+                 + (f", {size:,} bytes" if exists else ""))
+    st.write("Contents of `data/` folder (if it exists):")
+    if os.path.isdir("data"):
+        st.code("\n".join(os.listdir("data")) or "(empty)")
+    else:
+        st.code("(no 'data' folder here at all)")
+    st.write("Contents of current directory:")
+    st.code("\n".join(sorted(os.listdir("."))))
+
 st.sidebar.markdown("<hr style='border-color:rgba(94,234,212,.25);'>", unsafe_allow_html=True)
 mode = st.sidebar.radio("MISSION PROTOCOL", ["Live Ops Dashboard", "Judge Hardware Upload"])
 st.sidebar.markdown("<hr style='border-color:rgba(94,234,212,.25);'>", unsafe_allow_html=True)
